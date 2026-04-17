@@ -1,27 +1,38 @@
-# 🟫 PyCraft
+# PyCraft
 
 Um mini-jogo de blocos 3D feito em Python com [Ursina Engine](https://www.ursinaengine.org/).
 
-## 📦 Visão Geral
-PyCraft é um projeto simples inspirado em Minecraft, permitindo ao usuário construir e destruir blocos em um ambiente 3D. 
+## Visao Geral
 
-## 🚀 Instalação
+PyCraft e um projeto simples inspirado em Minecraft, permitindo ao usuario construir e destruir blocos em um ambiente 3D.
 
-1. Clone este repositório ou baixe os arquivos.
-2. Instale as dependências:
+## Requisitos
 
-```bash
-pip install -r requirements.txt
-```
+- Python 3.10+
 
-## ▶️ Como Executar
+## Instalacao
 
 ```bash
-py main.py
+./setup.sh
 ```
 
-## 🕹️ Controles
+O script cria `.venv/`, atualiza o `pip` e instala as dependencias do projeto.
 
-- **Colocar bloco:** clique direito
-- **Destruir bloco:** clique esquerdo
-- **Abrir menu:** tecla ESC
+## Como Executar
+
+```bash
+./run.sh
+```
+
+Alternativamente:
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+## Controles
+
+- Colocar bloco: clique direito
+- Destruir bloco: clique esquerdo
+- Abrir menu: `Esc`

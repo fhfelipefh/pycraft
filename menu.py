@@ -36,12 +36,12 @@ class GameMenu:
         )
         self.settings_bg = Entity(
             parent=camera.ui,
-            scale=(0.4, 0.3),
+            scale=(0.52, 0.3),
             enabled=False
         )
         self.btn_fullscreen = Button(
             text='Alternar Tela Cheia',
-            scale=(0.35, 0.1),
+            scale=(0.48, 0.1),
             position=(0, 0.05),
             parent=self.settings_bg,
             on_click=self.toggle_fullscreen
