@@ -8,10 +8,12 @@ from ursina import (
     Sky,
     Ursina,
     Vec3,
+    load_texture,
     application,
     camera,
     color,
     destroy,
+    held_keys,
     invoke,
     mouse,
     raycast,
@@ -20,6 +22,7 @@ from ursina import (
     window,
 )
 from ursina.shaders import unlit_shader
+from mob_textures import apply_texture_recursively
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from menu import GameMenu
@@ -47,6 +50,9 @@ CUSTOM_RENDER_HEIGHT = 24
 PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
 CLOUD_CYCLE_SECONDS = 9 * 60
+BLOCK_INTERACTION_RANGE = 20
+WALK_SPEED_MULTIPLIER = 1.0
+RUN_SPEED_MULTIPLIER = 1.5
 
 
 def resolve_asset_path(relative_path):
@@ -67,6 +73,77 @@ def resolve_existing_asset_or_fallback(candidates, fallback_texture="white_cube"
     if resolved_path is not None:
         return resolved_path
     return fallback_texture
+
+
+def _compose_rgba_if_opacity_exists(diffuse_path: str) -> str:
+    """If a corresponding *_opacity.png exists, compose an RGBA copy on-the-fly.
+
+    Returns the path to the composed file if created, otherwise the original
+    diffuse_path. This is a best-effort function and silently falls back when
+    Pillow is not available.
+    """
+    try:
+        from PIL import Image  # optional dependency
+    except Exception:
+        return diffuse_path
+
+    diffuse_abs = resolve_asset_path(diffuse_path)
+    stem = diffuse_abs.stem
+    suffix = diffuse_abs.suffix
+    opacity_abs = diffuse_abs.with_name(f"{stem}_opacity{suffix}")
+    if not opacity_abs.exists():
+        return diffuse_path
+
+    generated_rel = Path("textures/_generated").as_posix()
+    generated_dir = resolve_asset_path(generated_rel)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    out_rel = f"{generated_rel}/{stem}_rgba{suffix}"
+    out_abs = resolve_asset_path(out_rel)
+
+    try:
+        if not out_abs.exists() or out_abs.stat().st_mtime < max(diffuse_abs.stat().st_mtime, opacity_abs.stat().st_mtime):
+            base = Image.open(diffuse_abs).convert("RGB")
+            alpha_img = Image.open(opacity_abs).convert("L").resize(base.size)
+            rgba = Image.merge("RGBA", (*base.split(), alpha_img))
+            rgba.save(out_abs)
+        return out_rel
+    except Exception:
+        return diffuse_path
+
+
+def load_texture_or_fallback(path_like):
+    """Load a texture and fall back to a default when missing.
+
+    Explicitly loading and then forcing the texture on FBX submeshes avoids
+    cases where models render totalmente brancos (sem textura) em alguns
+    drivers/versões.
+    """
+    # Compose RGBA with *_opacity.png when disponível
+    candidate = _compose_rgba_if_opacity_exists(path_like)
+    resolved = resolve_existing_asset_or_fallback([candidate])
+    try:
+        tex = load_texture(resolved)
+        return tex or load_texture("white_cube")
+    except Exception:
+        return load_texture("white_cube")
+
+
+def apply_texture_recursively(entity, texture_obj):
+    # Aplica a textura no entity e em todos os filhos.
+    try:
+        entity.texture = texture_obj
+    except Exception:
+        pass
+    try:
+        entity.setTwoSided(True)
+    except Exception:
+        pass
+    for child in getattr(entity, "children", ()):
+        apply_texture_recursively(child, texture_obj)
+
+
+def get_existing_sound_files(candidates):
+    return [sound_file for sound_file in candidates if resolve_asset_path(sound_file).exists()]
 
 BLOCK_TYPES = [
     {
@@ -188,7 +265,6 @@ SOUND_GROUPS = {
         "hit": {
             "files": [
                 "sounds/Stone_mining1.ogg",
-                "sounds/Stone_mining2.ogg",
             ],
             "volume": 0.25,
             "pitch": 0.5,
@@ -222,7 +298,6 @@ was_grounded = [True]
 last_support_block = [None]
 last_render_cell = [None]
 sun_elapsed_time = [0.0]
-cloud_offset = [0.0]
 light_update_timer = [0.0]
 current_light_level = [255]
 
@@ -258,12 +333,16 @@ def play_sound_group(group_name, event_name):
     if not sound_data:
         return
 
+    available_files = get_existing_sound_files(sound_data["files"])
+    if not available_files:
+        return
+
     pitch = sound_data["pitch"]
     if isinstance(pitch, tuple):
         pitch = random.uniform(*pitch)
 
     Audio(
-        random.choice(sound_data["files"]),
+        random.choice(available_files),
         autoplay=True,
         volume=sound_data["volume"],
         pitch=pitch,
@@ -278,6 +357,21 @@ def play_material_sound(block_type, event_name):
         play_sound_group("stone", event_name)
     elif event_name == "step":
         play_sound_group("default", event_name)
+
+
+def can_interact_with_block(block_entity):
+    if block_entity is None:
+        return False
+
+    try:
+        block_position = block_entity.position
+    except AssertionError:
+        return False
+
+    if block_position is None:
+        return False
+
+    return (player.position - block_position).length() <= BLOCK_INTERACTION_RANGE
 
 
 def get_block_type_at(position):
@@ -445,15 +539,441 @@ sky_base_texture = resolve_existing_asset_or_fallback(
 
 cloud_layer_texture = resolve_existing_asset_or_fallback(
     [
-        f"{SKY_PATH}/sky_clouds.png",
         f"{SKY_PATH}/sky_clouds_dome.png",
+        f"{SKY_PATH}/sky_clouds.png",
     ],
     fallback_texture=sky_base_texture,
 )
 
 sky_base = Sky(texture=sky_base_texture)
-cloud_layer = Sky(texture=cloud_layer_texture, color=color.rgba(255, 255, 255, 210))
-cloud_layer.scale *= 0.995
+
+# Procedural cloud system: one dense pass with deterministic noise and soft fade.
+def cloud_noise(grid_x, grid_z, salt=0):
+    value = math.sin((grid_x * 127.1) + (grid_z * 311.7) + (salt * 74.7)) * 43758.5453
+    return value - math.floor(value)
+
+
+CLOUD_GRID_SIZE = 220
+CLOUD_VIEW_RADIUS = 0
+CLOUD_SPAWN_THRESHOLD = 1.0
+CLOUD_FADE_RADIUS = CLOUD_GRID_SIZE * 4.2
+CLOUD_MIN_HEIGHT = 28
+CLOUD_MAX_HEIGHT = 92
+CLOUD_MIN_SCALE = 260
+CLOUD_MAX_SCALE = 760
+CLOUD_MIN_ALPHA = 72
+CLOUD_MAX_ALPHA = 240
+
+active_clouds = {}  # Key: (grid_x, grid_z), Value: Entity
+cloud_pool = []
+
+
+def get_or_create_cloud():
+    if cloud_pool:
+        cloud = cloud_pool.pop()
+        cloud.show()
+        for puff in getattr(cloud, "cloud_puffs", []):
+            puff.show()
+        return cloud
+
+    cloud = Entity(
+        parent=scene,
+        enabled=True,
+    )
+
+    cloud.cloud_puffs = []
+    puff_specs = [
+        (-0.18, 0.02, 0.95, 0.96, 0.96),
+        (0.12, -0.03, 0.78, 1.08, 0.82),
+        (0.0, 0.05, 1.12, 0.90, 1.00),
+        (0.22, 0.01, 0.70, 0.80, 0.88),
+    ]
+
+    for offset_x, offset_y, scale_factor, alpha_factor, width_factor in puff_specs:
+        puff = Entity(
+            parent=cloud,
+            model="quad",
+            texture=cloud_layer_texture,
+            color=color.rgba(255, 255, 255, 255),
+            position=Vec3(offset_x, offset_y, 0),
+            scale=(1, 1),
+            double_sided=True,
+            unlit=True,
+        )
+        puff.scale_factor = scale_factor
+        puff.alpha_factor = alpha_factor
+        puff.width_factor = width_factor
+        cloud.cloud_puffs.append(puff)
+
+    return cloud
+
+
+def return_cloud_to_pool(cloud):
+    cloud.hide()
+    for puff in getattr(cloud, "cloud_puffs", []):
+        puff.hide()
+    cloud_pool.append(cloud)
+
+chicken_model_path = resolve_existing_asset_or_fallback(["mobs/minecraft-chicken/source/chicken.fbx"])
+chicken_tex_obj = load_texture_or_fallback("mobs/minecraft-chicken/textures/chicken.png")
+chicken = Entity(
+    parent=scene,
+    model=chicken_model_path,
+    texture=chicken_tex_obj,
+    position=Vec3(4, 0.53, 4),
+    scale=0.07,
+    rotation_y=180,
+    unlit=True,
+)
+apply_texture_recursively(chicken, chicken_tex_obj)
+chicken.setTwoSided(True)
+chicken.collider = "box"
+
+chicken_spawn_position = Vec3(chicken.x, chicken.y, chicken.z)
+chicken_walk_target = [None]
+chicken_walk_speed = 0.9
+chicken_walk_radius = 6.0
+chicken_walk_reach_distance = 0.35
+chicken_animation_time = [0.0]
+chicken_body_bob = [0.0]
+
+chicken_left_leg = Entity(
+    parent=chicken,
+    model="cube",
+    color=color.rgb(92, 68, 34),
+    scale=(0.035, 0.16, 0.035),
+    position=Vec3(-0.05, -0.17, 0.03),
+    origin_y=0.5,
+)
+
+chicken_right_leg = Entity(
+    parent=chicken,
+    model="cube",
+    color=color.rgb(92, 68, 34),
+    scale=(0.035, 0.16, 0.035),
+    position=Vec3(0.05, -0.17, 0.03),
+    origin_y=0.5,
+)
+
+chicken_left_wing = Entity(
+    parent=chicken,
+    model="cube",
+    color=color.rgb(236, 228, 208),
+    scale=(0.05, 0.025, 0.11),
+    position=Vec3(-0.12, 0.03, 0.0),
+    origin_x=0.5,
+)
+
+chicken_right_wing = Entity(
+    parent=chicken,
+    model="cube",
+    color=color.rgb(236, 228, 208),
+    scale=(0.05, 0.025, 0.11),
+    position=Vec3(0.12, 0.03, 0.0),
+    origin_x=-0.5,
+)
+
+
+def mob_position_is_blocked(position, player_radius=0.75):
+    if position.y < GROUND_Y + 0.05:
+        return True
+
+    player_distance = Vec3(position.x - player.x, 0, position.z - player.z).length()
+    if player_distance < player_radius and abs(position.y - player.y) < 1.4:
+        return True
+
+    for block in active_blocks.values():
+        block_position = block.grid_position
+        if abs(block_position[1] - position.y) > 1.2:
+            continue
+
+        dx = abs(block_position[0] - position.x)
+        dz = abs(block_position[2] - position.z)
+        if dx < 0.48 and dz < 0.48:
+            return True
+
+    return False
+
+
+def chicken_position_is_blocked(position):
+    return mob_position_is_blocked(position, player_radius=0.75)
+
+
+def update_chicken_animation(move_amount):
+    chicken_animation_time[0] += time.dt * (2.5 + (move_amount * 6.0))
+    walk_cycle = chicken_animation_time[0] * (5.0 if move_amount > 0.01 else 1.6)
+
+    leg_swing = math.sin(walk_cycle) * (28 if move_amount > 0.01 else 5)
+    wing_swing = math.sin(walk_cycle * 1.7) * (18 if move_amount > 0.01 else 3)
+    bob = 0.0
+
+    chicken_left_leg.rotation_x = leg_swing
+    chicken_right_leg.rotation_x = -leg_swing
+    chicken_left_wing.rotation_z = wing_swing
+    chicken_right_wing.rotation_z = -wing_swing
+
+    chicken_body_bob[0] = bob
+    chicken.y = chicken_spawn_position.y
+    chicken.rotation_z = math.sin(chicken_animation_time[0] * 0.7) * 1.4
+
+
+def get_new_chicken_walk_target():
+    offset_x = random.uniform(-chicken_walk_radius, chicken_walk_radius)
+    offset_z = random.uniform(-chicken_walk_radius, chicken_walk_radius)
+    return Vec3(
+        chicken_spawn_position.x + offset_x,
+        chicken_spawn_position.y,
+        chicken_spawn_position.z + offset_z,
+    )
+
+
+def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False):
+    spawn_position = Vec3(position.x, position.y + ground_offset, position.z)
+    model_resolved = resolve_existing_asset_or_fallback([model_path])
+    tex_obj = load_texture_or_fallback(texture_path)
+    mob = Entity(
+        parent=scene,
+        model=model_resolved,
+        texture=tex_obj,
+        position=spawn_position,
+        scale=scale,
+        rotation_y=rotation_y,
+        unlit=True,
+        color=tint,
+    )
+    apply_texture_recursively(mob, tex_obj)
+    mob.setTwoSided(True)
+    mob.collider = "box"
+    return {
+        "name": name,
+        "entity": mob,
+        "spawn": Vec3(mob.x, mob.y, mob.z),
+        "target": [None],
+        "walk_speed": walk_speed,
+        "walk_radius": walk_radius,
+        "reach_distance": 0.35,
+        "player_radius": player_radius,
+        "animation_time": [0.0],
+        "floating": floating,
+        "ground_offset": ground_offset,
+    }
+
+
+def get_new_mob_walk_target(mob_state):
+    offset_x = random.uniform(-mob_state["walk_radius"], mob_state["walk_radius"])
+    offset_z = random.uniform(-mob_state["walk_radius"], mob_state["walk_radius"])
+    spawn = mob_state["spawn"]
+    return Vec3(spawn.x + offset_x, spawn.y, spawn.z + offset_z)
+
+
+def update_generic_mob_walk(mob_state):
+    mob = mob_state["entity"]
+    target = mob_state["target"][0]
+
+    if target is None:
+        mob_state["target"][0] = get_new_mob_walk_target(mob_state)
+        return
+
+    to_target = Vec3(target.x - mob.x, 0, target.z - mob.z)
+    distance_to_target = to_target.length()
+
+    if distance_to_target <= mob_state["reach_distance"]:
+        mob_state["target"][0] = get_new_mob_walk_target(mob_state)
+        return
+
+    direction = to_target.normalized()
+    step_distance = mob_state["walk_speed"] * time.dt
+    next_position = Vec3(
+        mob.x + (direction.x * step_distance),
+        mob_state["spawn"].y,
+        mob.z + (direction.z * step_distance),
+    )
+
+    if mob_position_is_blocked(next_position, player_radius=mob_state["player_radius"]):
+        x_only_position = Vec3(next_position.x, mob_state["spawn"].y, mob.z)
+        z_only_position = Vec3(mob.x, mob_state["spawn"].y, next_position.z)
+
+        if not mob_position_is_blocked(x_only_position, player_radius=mob_state["player_radius"]):
+            mob.x = x_only_position.x
+        elif not mob_position_is_blocked(z_only_position, player_radius=mob_state["player_radius"]):
+            mob.z = z_only_position.z
+        else:
+            mob_state["target"][0] = get_new_mob_walk_target(mob_state)
+            return
+    else:
+        mob.position = next_position
+
+    if direction.length() > 0:
+        mob.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
+
+    mob_state["animation_time"][0] += time.dt * (2.2 + (step_distance * 5.0))
+    mob.rotation_z = math.sin(mob_state["animation_time"][0] * 0.45) * 1.2
+
+
+def update_bat_mob(mob_state):
+    mob = mob_state["entity"]
+    mob_state["animation_time"][0] += time.dt * 4.5
+    mob.y = mob_state["spawn"][1] + math.sin(mob_state["animation_time"][0]) * 0.18
+    mob.rotation_z = math.sin(mob_state["animation_time"][0] * 1.8) * 10
+    mob.rotation_y = (mob.rotation_y + (time.dt * 28.0)) % 360
+
+
+def update_ambient_mobs():
+    for mob_state in ambient_mob_states.values():
+        if mob_state["name"] == "bat":
+            update_bat_mob(mob_state)
+        else:
+            update_generic_mob_walk(mob_state)
+
+
+ambient_mobs = [
+    create_ambient_mob(
+        "cow",
+        "mobs/minecraft-cow/source/cow.fbx",
+        "mobs/minecraft-cow/textures/cow.png",
+        Vec3(10, 0.53, 6),
+        0.08,
+        0.72,
+        7.0,
+        rotation_y=180,
+        ground_offset=-0.02,
+        player_radius=0.9,
+    ),
+    create_ambient_mob(
+        "sheep",
+        "mobs/minecraft-sheep/source/sheep.fbx",
+        "mobs/minecraft-sheep/textures/sheep.png",
+        Vec3(-7, 0.53, 9),
+        0.08,
+        0.78,
+        6.0,
+        rotation_y=180,
+        ground_offset=-0.02,
+        player_radius=0.8,
+    ),
+    create_ambient_mob(
+        "villager",
+        "mobs/minecraft-villager/source/villager.fbx",
+        "mobs/minecraft-villager/textures/villager_farmer.png",
+        Vec3(14, 0.53, -5),
+        0.075,
+        0.68,
+        6.5,
+        rotation_y=180,
+        ground_offset=0.05,
+        player_radius=0.8,
+    ),
+    create_ambient_mob(
+        "zombie",
+        "mobs/minecraft-zombie/source/zombie.fbx",
+        "mobs/minecraft-zombie/textures/zombie.png",
+        Vec3(-12, 0.53, -8),
+        0.075,
+        0.74,
+        7.5,
+        rotation_y=180,
+        tint=color.rgb(220, 235, 220),
+        ground_offset=0.0,
+        player_radius=0.85,
+    ),
+    create_ambient_mob(
+        "iron_golem",
+        "mobs/minecraft-iron-golem/source/iron_golem.fbx",
+        "mobs/minecraft-iron-golem/textures/iron_golem.png",
+        Vec3(18, 0.53, 10),
+        0.065,
+        0.52,
+        5.5,
+        rotation_y=180,
+        ground_offset=0.18,
+        player_radius=1.2,
+    ),
+    create_ambient_mob(
+        "slime",
+        "mobs/minecraft-slime/source/slime.fbx",
+        "mobs/minecraft-slime/textures/slime.png",
+        Vec3(2, 0.53, -14),
+        0.085,
+        0.58,
+        4.5,
+        rotation_y=180,
+        tint=color.rgba(255, 255, 255, 210),
+        ground_offset=-0.08,
+        player_radius=0.7,
+    ),
+    create_ambient_mob(
+        "spider",
+        "mobs/minecraft-spider/source/spider.fbx",
+        "mobs/minecraft-spider/textures/spider.png",
+        Vec3(-18, 0.53, 4),
+        0.07,
+        0.84,
+        8.0,
+        rotation_y=180,
+        ground_offset=-0.03,
+        player_radius=0.85,
+    ),
+    create_ambient_mob(
+        "bat",
+        "mobs/minecraft-bat/source/bat.fbx",
+        "mobs/minecraft-bat/textures/bat.png",
+        Vec3(6, 3.2, -8),
+        0.06,
+        0.0,
+        0.0,
+        rotation_y=180,
+        tint=color.rgba(255, 255, 255, 220),
+        ground_offset=2.2,
+        floating=True,
+        player_radius=0.5,
+    ),
+]
+
+ambient_mob_states = {
+    mob_state["name"]: mob_state for mob_state in ambient_mobs
+}
+
+
+def update_chicken_walking():
+    target = chicken_walk_target[0]
+    if target is None:
+        chicken_walk_target[0] = get_new_chicken_walk_target()
+        return
+
+    to_target = Vec3(target.x - chicken.x, 0, target.z - chicken.z)
+    distance_to_target = to_target.length()
+
+    if distance_to_target <= chicken_walk_reach_distance:
+        chicken_walk_target[0] = get_new_chicken_walk_target()
+        return
+
+    direction = to_target.normalized()
+    step_distance = chicken_walk_speed * time.dt
+    next_position = Vec3(
+        chicken.x + (direction.x * step_distance),
+        chicken_spawn_position.y,
+        chicken.z + (direction.z * step_distance),
+    )
+
+    if chicken_position_is_blocked(next_position):
+        x_only_position = Vec3(next_position.x, chicken_spawn_position.y, chicken.z)
+        z_only_position = Vec3(chicken.x, chicken_spawn_position.y, next_position.z)
+
+        if not chicken_position_is_blocked(x_only_position):
+            chicken.x = x_only_position.x
+        elif not chicken_position_is_blocked(z_only_position):
+            chicken.z = z_only_position.z
+        else:
+            chicken_walk_target[0] = get_new_chicken_walk_target()
+            update_chicken_animation(0.0)
+            return
+    else:
+        chicken.position = next_position
+
+    if direction.length() > 0:
+        chicken.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
+
+    update_chicken_animation(step_distance)
 
 sun_visual = Entity(
     parent=scene,
@@ -474,6 +994,7 @@ sun_glow = Entity(
 )
 
 player = FirstPersonController()
+player.base_speed = getattr(player, "speed", 5)
 spawn_point = Vec3(player.x, player.y, player.z)
 set_global_light_level(1.0)
 sync_active_blocks(force=True)
@@ -587,6 +1108,9 @@ def input(key):
     if target_block is None:
         return
 
+    if not can_interact_with_block(target_block):
+        return
+
     if key == "right mouse down":
         new_position = to_grid_position(target_block.position + mouse.normal)
         if get_block_type_at(new_position) is None:
@@ -605,6 +1129,15 @@ def input(key):
 def update():
     sync_active_blocks()
     update_highlight()
+    update_ambient_mobs()
+    update_chicken_walking()
+
+    is_running = bool(
+        held_keys.get("control")
+        or held_keys.get("left control")
+        or held_keys.get("right control")
+    )
+    player.speed = player.base_speed * (RUN_SPEED_MULTIPLIER if is_running else WALK_SPEED_MULTIPLIER)
 
     sun_elapsed_time[0] = (sun_elapsed_time[0] + time.dt) % SUN_CYCLE_SECONDS
     day_progress = sun_elapsed_time[0] / SUN_CYCLE_SECONDS
@@ -613,8 +1146,93 @@ def update():
 
     sun_visual.position = player.position + (sun_direction * 300)
     sun_visual.look_at(camera.world_position)
-    cloud_offset[0] = (cloud_offset[0] + (time.dt / CLOUD_CYCLE_SECONDS)) % 1
-    cloud_layer.texture_offset = (cloud_offset[0], 0)
+    
+    # Update procedural cloud field around player
+    player_grid_x = math.floor(player.x / CLOUD_GRID_SIZE)
+    player_grid_z = math.floor(player.z / CLOUD_GRID_SIZE)
+    clouds_to_update = set()
+
+    for offset_x in range(-CLOUD_VIEW_RADIUS, CLOUD_VIEW_RADIUS + 1):
+        for offset_z in range(-CLOUD_VIEW_RADIUS, CLOUD_VIEW_RADIUS + 1):
+            grid_x = player_grid_x + offset_x
+            grid_z = player_grid_z + offset_z
+            key = (grid_x, grid_z)
+
+            noise_a = cloud_noise(grid_x, grid_z, 1)
+            noise_b = cloud_noise(grid_x, grid_z, 2)
+            noise_c = cloud_noise(grid_x, grid_z, 3)
+            noise_d = cloud_noise(grid_x, grid_z, 4)
+            noise_e = cloud_noise(grid_x, grid_z, 5)
+
+            if noise_a < CLOUD_SPAWN_THRESHOLD:
+                continue
+
+            clouds_to_update.add(key)
+
+            cloud_x = (grid_x + 0.5 + ((noise_a - 0.5) * 0.8)) * CLOUD_GRID_SIZE
+            cloud_z = (grid_z + 0.5 + ((noise_b - 0.5) * 0.8)) * CLOUD_GRID_SIZE
+            cloud_y = CLOUD_MIN_HEIGHT + (noise_c * (CLOUD_MAX_HEIGHT - CLOUD_MIN_HEIGHT))
+            cloud_scale = CLOUD_MIN_SCALE + (noise_d * (CLOUD_MAX_SCALE - CLOUD_MIN_SCALE))
+
+            camera_position = camera.world_position
+            dx = cloud_x - camera_position.x
+            dy = cloud_y - camera_position.y
+            dz = cloud_z - camera_position.z
+            distance_from_camera = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+            fade_factor = max(0.0, 1.0 - (distance_from_camera / CLOUD_FADE_RADIUS))
+            fade_factor = fade_factor * fade_factor
+
+            alpha = int((CLOUD_MIN_ALPHA + (noise_e * (CLOUD_MAX_ALPHA - CLOUD_MIN_ALPHA))) * fade_factor)
+
+            if key not in active_clouds:
+                cloud = get_or_create_cloud()
+                active_clouds[key] = cloud
+            else:
+                cloud = active_clouds[key]
+
+            cloud.position = Vec3(cloud_x, cloud_y, cloud_z)
+            cloud.scale = 1
+
+            cloud_width = cloud_scale * 0.95
+            cloud_depth = cloud_scale * 0.42
+            cloud_height = 70
+
+            puff_offsets = [
+                Vec3(-cloud_width * 0.22, 0.08, 0),
+                Vec3(cloud_width * 0.16, -0.04, 0),
+                Vec3(0, cloud_height * 0.10, 0),
+                Vec3(cloud_width * 0.28, 0.02, 0),
+            ]
+
+            puff_scales = [
+                (cloud_width * 0.78, cloud_depth * 0.55),
+                (cloud_width * 0.62, cloud_depth * 0.48),
+                (cloud_width * 0.86, cloud_depth * 0.60),
+                (cloud_width * 0.50, cloud_depth * 0.42),
+            ]
+
+            puff_alphas = [
+                int(alpha * 0.96),
+                int(alpha * 0.84),
+                int(alpha * 1.00),
+                int(alpha * 0.74),
+            ]
+
+            for puff, puff_offset, puff_scale, puff_alpha in zip(
+                cloud.cloud_puffs,
+                puff_offsets,
+                puff_scales,
+                puff_alphas,
+            ):
+                puff.position = puff_offset
+                puff.scale = puff_scale
+                puff.color = color.rgba(255, 255, 255, max(0, puff_alpha))
+
+    # Remove clouds that are out of range
+    clouds_to_remove = [key for key in active_clouds if key not in clouds_to_update]
+    for key in clouds_to_remove:
+        return_cloud_to_pool(active_clouds[key])
+        del active_clouds[key]
 
     daylight = max(0.18, min(1.0, (sun_direction.y + 0.2) / 1.2))
     set_global_light_level(daylight)
