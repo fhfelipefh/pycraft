@@ -11,4 +11,14 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
 fi
 
 cd "$ROOT_DIR"
+
+# Native acceleration is mandatory for runtime performance.
+if ! "$VENV_PYTHON" - <<'PY'
+import voxel_accel
+PY
+then
+    echo "Modulo nativo obrigatorio nao encontrado. Execute ./setup.sh novamente."
+    exit 1
+fi
+
 exec "$VENV_PYTHON" main.py

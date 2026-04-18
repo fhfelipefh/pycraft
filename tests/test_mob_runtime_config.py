@@ -12,16 +12,16 @@ def test_removed_mobs_are_not_in_ambient_list():
     assert '"zombie"' not in text
 
 
-def test_villager_ground_offset_is_raised():
+def test_villager_is_not_in_ambient_list_anymore():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert '"villager"' in text
-    assert "ground_offset=0.0" in text
+    assert '"villager"' not in text
+    assert "npcs/david_t_pose.fbx" not in text
 
 
 def test_render_distance_was_increased():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "RENDER_RADIUS = 28" in text
-    assert "CUSTOM_RENDER_RADIUS = 84" in text
+    assert "RENDER_RADIUS = 30" in text
+    assert "CUSTOM_RENDER_RADIUS = 88" in text
 
 
 def test_mobs_are_paused_when_menu_is_open():

@@ -11,4 +11,9 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
+# Native acceleration is mandatory.
+cd "$ROOT_DIR/native"
+python setup.py build_ext --inplace
+cd "$ROOT_DIR"
+
 echo "Ambiente pronto. Execute ./run.sh"

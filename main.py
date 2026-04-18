@@ -1,11 +1,14 @@
 from pathlib import Path
 import math
 import random
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 
 from ursina import (
     Audio,
     Entity,
     Sky,
+    Text,
     Ursina,
     Vec3,
     load_texture,
@@ -24,6 +27,8 @@ from ursina import (
 from ursina.shaders import unlit_shader
 from mob_textures import apply_texture_recursively
 from mob_grounding import get_support_top_y, compute_lift_delta, compute_grounded_entity_y
+from voxel_accel import get_filtered_custom_positions, get_flat_ground_positions
+from terrain_async_scheduler import DesiredPositionsScheduler
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from menu import GameMenu
@@ -49,9 +54,9 @@ BGM_CANDIDATES = [
     Path("sounds/Fireflies.ogg").as_posix(),
 ]
 GROUND_Y = 0
-RENDER_RADIUS = 28
+RENDER_RADIUS = 30
 RENDER_HEIGHT = 12
-CUSTOM_RENDER_RADIUS = 84
+CUSTOM_RENDER_RADIUS = 88
 CUSTOM_RENDER_HEIGHT = 24
 PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
@@ -79,6 +84,21 @@ def resolve_existing_asset_or_fallback(candidates, fallback_texture="white_cube"
     if resolved_path is not None:
         return resolved_path
     return fallback_texture
+
+
+def resolve_model_sidecar_texture(model_path):
+    model_rel = Path(model_path)
+    parent = model_rel.parent
+    stem = model_rel.stem
+    candidates = []
+
+    for ext in ("png", "jpg", "jpeg", "tga", "bmp"):
+        candidates.append((parent / f"{stem}.{ext}").as_posix())
+        candidates.append((parent / f"{stem}_albedo.{ext}").as_posix())
+        candidates.append((parent / f"{stem}_diffuse.{ext}").as_posix())
+        candidates.append((parent / f"{stem}_baseColor.{ext}").as_posix())
+
+    return resolve_existing_asset_path(candidates)
 
 
 def _compose_rgba_if_opacity_exists(diffuse_path: str) -> str:
@@ -224,6 +244,12 @@ BLOCK_TYPES = [
         "icon_texture": "dirt.png",
         "material": "dirt",
     },
+    {
+        "name": "Bloco Verde",
+        "block_texture": "grass.png",
+        "icon_texture": "grass.png",
+        "material": "grass",
+    },
 ]
 GROUND_BLOCK_TYPE = BLOCK_TYPES[0]
 
@@ -354,10 +380,26 @@ last_render_cell = [None]
 sun_elapsed_time = [0.0]
 light_update_timer = [0.0]
 current_light_level = [255]
+fps_overlay_visible = [False]
+fps_timer = [0.0]
+fps_frames = [0]
 
 active_blocks = {}
 custom_blocks = {}
 removed_blocks = set()
+
+desired_positions_executor = ThreadPoolExecutor(max_workers=2)
+desired_positions_scheduler = [None]
+
+
+def _shutdown_desired_positions_executor():
+    try:
+        desired_positions_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_desired_positions_executor)
 
 
 def toggle_fullscreen():
@@ -494,25 +536,66 @@ def get_desired_positions(render_cell):
     px, py, pz = render_cell
     desired = set()
 
-    for dx in range(-RENDER_RADIUS, RENDER_RADIUS + 1):
-        for dz in range(-RENDER_RADIUS, RENDER_RADIUS + 1):
-            desired.add((px + dx, GROUND_Y, pz + dz))
+    for position in get_flat_ground_positions(px, pz, RENDER_RADIUS, GROUND_Y):
+        desired.add(position)
 
-    for position in custom_blocks:
-        if (
-            abs(position[0] - px) <= CUSTOM_RENDER_RADIUS
-            and abs(position[2] - pz) <= CUSTOM_RENDER_RADIUS
-            and abs(position[1] - py) <= CUSTOM_RENDER_HEIGHT
-        ):
-            desired.add(position)
+    filtered_custom_positions = get_filtered_custom_positions(
+        custom_blocks.keys(),
+        px,
+        py,
+        pz,
+        CUSTOM_RENDER_RADIUS,
+        CUSTOM_RENDER_HEIGHT,
+    )
 
-            for dx in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-                for dz in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-                    ground_position = (position[0] + dx, GROUND_Y, position[2] + dz)
-                    if ground_position not in removed_blocks:
-                        desired.add(ground_position)
+    for position in filtered_custom_positions:
+        desired.add(position)
+
+        for dx in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
+            for dz in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
+                ground_position = (position[0] + dx, GROUND_Y, position[2] + dz)
+                if ground_position not in removed_blocks:
+                    desired.add(ground_position)
 
     return desired
+
+
+def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_positions):
+    if render_cell is None:
+        return set()
+
+    px, py, pz = render_cell
+    desired = set()
+
+    for position in get_flat_ground_positions(px, pz, RENDER_RADIUS, GROUND_Y):
+        desired.add(position)
+
+    filtered_custom_positions = get_filtered_custom_positions(
+        custom_positions,
+        px,
+        py,
+        pz,
+        CUSTOM_RENDER_RADIUS,
+        CUSTOM_RENDER_HEIGHT,
+    )
+
+    removed_positions = set(removed_positions)
+    for position in filtered_custom_positions:
+        desired.add(position)
+
+        for dx in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
+            for dz in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
+                ground_position = (position[0] + dx, GROUND_Y, position[2] + dz)
+                if ground_position not in removed_positions:
+                    desired.add(ground_position)
+
+    return desired
+
+
+desired_positions_scheduler[0] = DesiredPositionsScheduler(
+    desired_positions_executor,
+    get_desired_positions_from_snapshots,
+)
 
 
 def sync_active_blocks(force=False):
@@ -520,7 +603,18 @@ def sync_active_blocks(force=False):
     if not force and render_cell == last_render_cell[0]:
         return
 
-    desired_positions = get_desired_positions(render_cell)
+    if force:
+        desired_positions = get_desired_positions(render_cell)
+    else:
+        desired_positions_scheduler[0].request(
+            render_cell,
+            tuple(custom_blocks.keys()),
+            tuple(removed_blocks),
+        )
+        desired_positions = desired_positions_scheduler[0].consume(render_cell)
+        if desired_positions is None:
+            return
+
     current_positions = set(active_blocks)
 
     for position in current_positions - desired_positions:
@@ -736,15 +830,26 @@ def mob_position_is_blocked(position, player_radius=0.75):
     if player_distance < player_radius and abs(position.y - player.y) < 1.4:
         return True
 
-    for block in active_blocks.values():
-        block_position = block.grid_position
-        if abs(block_position[1] - position.y) > 1.2:
-            continue
+    # Evita varrer todos os blocos ativos por frame: verifica apenas células vizinhas.
+    min_x = math.floor(position.x - 0.48)
+    max_x = math.ceil(position.x + 0.48)
+    min_z = math.floor(position.z - 0.48)
+    max_z = math.ceil(position.z + 0.48)
+    min_y = math.floor(position.y - 1.2)
+    max_y = math.ceil(position.y + 1.2)
 
-        dx = abs(block_position[0] - position.x)
-        dz = abs(block_position[2] - position.z)
-        if dx < 0.48 and dz < 0.48:
-            return True
+    for bx in range(min_x, max_x + 1):
+        for bz in range(min_z, max_z + 1):
+            if abs(bx - position.x) >= 0.48 or abs(bz - position.z) >= 0.48:
+                continue
+
+            for by in range(min_y, max_y + 1):
+                # Chão base não deve bloquear o deslocamento horizontal do mob.
+                if by <= GROUND_Y:
+                    continue
+
+                if get_block_type_at((bx, by, bz)) is not None:
+                    return True
 
     return False
 
@@ -781,10 +886,11 @@ def get_new_chicken_walk_target():
     )
 
 
-def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False, use_opacity_map=True):
+def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False, use_opacity_map=True, animations=None, unlit=True):
     spawn_position = Vec3(position.x, position.y + ground_offset, position.z)
     model_resolved = resolve_existing_asset_or_fallback([model_path])
-    tex_obj = load_texture_or_fallback(texture_path, use_opacity_map=use_opacity_map)
+    texture_candidate = texture_path or resolve_model_sidecar_texture(model_resolved)
+    tex_obj = load_texture_or_fallback(texture_candidate, use_opacity_map=use_opacity_map) if texture_candidate else None
     mob = Entity(
         parent=scene,
         model=model_resolved,
@@ -792,10 +898,11 @@ def create_ambient_mob(name, model_path, texture_path, position, scale, walk_spe
         position=spawn_position,
         scale=scale,
         rotation_y=rotation_y,
-        unlit=True,
+        unlit=unlit,
         color=tint,
     )
-    apply_texture_recursively(mob, tex_obj)
+    if tex_obj is not None:
+        apply_texture_recursively(mob, tex_obj)
     mob.setTwoSided(True)
     mob.collider = "box"
     grounded_y = mob.y
@@ -803,6 +910,12 @@ def create_ambient_mob(name, model_path, texture_path, position, scale, walk_spe
         # Garante que o mob não nasça enterrado no terreno/blocos.
         if lift_entity_out_of_blocks(mob):
             grounded_y = mob.y
+
+    resolved_animations = {}
+    if animations:
+        for key, anim_path in animations.items():
+            resolved_animations[key] = resolve_existing_asset_or_fallback([anim_path], fallback_texture=model_resolved)
+
     return {
         "name": name,
         "entity": mob,
@@ -816,7 +929,31 @@ def create_ambient_mob(name, model_path, texture_path, position, scale, walk_spe
         "animation_time": [0.0],
         "floating": floating,
         "ground_offset": ground_offset,
+        "animations": resolved_animations,
+        "current_animation": ["__spawn__"],
+        "texture_obj": tex_obj,
     }
+
+
+def set_mob_animation(mob_state, animation_key):
+    animations = mob_state.get("animations") or {}
+    model_path = animations.get(animation_key)
+    if not model_path:
+        return
+
+    if mob_state["current_animation"][0] == animation_key:
+        return
+
+    mob = mob_state["entity"]
+    try:
+        mob.model = model_path
+    except Exception:
+        # Mantém o modelo atual quando a animação/modelo não é compatível.
+        return
+    tex_obj = mob_state.get("texture_obj")
+    if tex_obj is not None:
+        apply_texture_recursively(mob, tex_obj)
+    mob_state["current_animation"][0] = animation_key
 
 
 def get_new_mob_walk_target(mob_state):
@@ -832,6 +969,8 @@ def update_generic_mob_walk(mob_state):
     ground_y = mob_state.get("grounded_y", mob_state["spawn"].y)
 
     if target is None:
+        set_mob_animation(mob_state, "idle")
+        mob.rotation_z = math.sin((sun_elapsed_time[0] * 1.8) + (mob_state["spawn"].x * 0.3)) * 0.7
         mob_state["target"][0] = get_new_mob_walk_target(mob_state)
         return
 
@@ -839,10 +978,13 @@ def update_generic_mob_walk(mob_state):
     distance_to_target = to_target.length()
 
     if distance_to_target <= mob_state["reach_distance"]:
+        set_mob_animation(mob_state, "idle")
+        mob.rotation_z = math.sin((sun_elapsed_time[0] * 1.8) + (mob_state["spawn"].x * 0.3)) * 0.7
         mob_state["target"][0] = get_new_mob_walk_target(mob_state)
         return
 
     direction = to_target.normalized()
+    set_mob_animation(mob_state, "walk")
     step_distance = mob_state["walk_speed"] * time.dt
     next_position = Vec3(
         mob.x + (direction.x * step_distance),
@@ -876,10 +1018,6 @@ def update_generic_mob_walk(mob_state):
 
 def update_ambient_mobs():
     for mob_state in ambient_mob_states.values():
-        mob = mob_state["entity"]
-        if lift_entity_out_of_blocks(mob):
-            mob_state["grounded_y"] = mob.y
-            mob_state["spawn"] = Vec3(mob_state["spawn"].x, mob.y, mob_state["spawn"].z)
         update_generic_mob_walk(mob_state)
 
 
@@ -906,18 +1044,6 @@ ambient_mobs = [
         6.0,
         rotation_y=180,
         ground_offset=-0.02,
-        player_radius=0.8,
-    ),
-    create_ambient_mob(
-        "villager",
-        "mobs/minecraft-villager/source/villager.fbx",
-        "mobs/minecraft-villager/textures/villager_farmer.png",
-        Vec3(14, 0.53, -5),
-        0.075,
-        0.68,
-        6.5,
-        rotation_y=180,
-        ground_offset=0.0,
         player_radius=0.8,
     ),
     create_ambient_mob(
@@ -1022,20 +1148,56 @@ sync_active_blocks(force=True)
 menu = None
 crosshair = None
 background_music = None
+music_enabled = [True]
+music_volume = [0.25]
+fps_overlay = None
+fps_overlay_text = None
 
 
 def on_menu_toggle(state):
     if crosshair is not None:
         crosshair.enabled = not state
+    if fps_overlay is not None:
+        fps_overlay.enabled = fps_overlay_visible[0] and not state
+    if fps_overlay_text is not None:
+        fps_overlay_text.enabled = fps_overlay_visible[0] and not state
     if state:
         play_menu_click_sound()
+
+
+def toggle_music_enabled():
+    music_enabled[0] = not music_enabled[0]
+    if background_music is not None:
+        background_music.volume = music_volume[0] if music_enabled[0] else 0.0
+
+
+def get_music_enabled():
+    return music_enabled[0]
+
+
+def get_music_volume():
+    return music_volume[0]
+
+
+def set_music_volume_delta(delta):
+    music_volume[0] = max(0.0, min(1.0, music_volume[0] + delta))
+    if background_music is not None:
+        background_music.volume = music_volume[0] if music_enabled[0] else 0.0
 
 
 def is_game_paused():
     return bool(menu and menu.menu_open)
 
 
-menu = GameMenu(player, on_menu_toggle, toggle_fullscreen)
+menu = GameMenu(
+    player,
+    on_menu_toggle,
+    toggle_fullscreen,
+    toggle_music_enabled,
+    get_music_enabled,
+    get_music_volume,
+    set_music_volume_delta,
+)
 
 crosshair = Entity(
     parent=camera.ui,
@@ -1052,8 +1214,26 @@ if available_bgm_files:
         random.choice(available_bgm_files),
         autoplay=True,
         loop=True,
-        volume=0.25,
+        volume=music_volume[0],
     )
+
+fps_overlay = Entity(
+    parent=camera.ui,
+    model="quad",
+    color=color.rgba(0, 0, 0, 120),
+    position=(0.43, 0.46, 0.7),
+    scale=(0.14, 0.06),
+    enabled=False,
+)
+fps_overlay_text = Text(
+    parent=camera.ui,
+    text="FPS: --",
+    color=color.white,
+    position=(0.43, 0.46, 0.6),
+    origin=(0, 0),
+    scale=0.9,
+    enabled=False,
+)
 
 hotbar_bg = Entity(
     parent=camera.ui,
@@ -1073,6 +1253,8 @@ hotbar_selector = Entity(
 
 hotbar_icons = []
 hotbar_slot_positions = []
+hud_heart_icons = []
+hud_armor_icons = []
 
 
 def create_hotbar_ui():
@@ -1099,8 +1281,50 @@ def update_hotbar_ui():
     hotbar_selector.x = hotbar_slot_positions[selected_block_index]
 
 
+def create_status_hud():
+    heart_full = resolve_existing_asset_path([f"{UI_PATH}/Heart_(texture)_JE1_BE1.png"]) or "white_cube"
+    armor_full = resolve_existing_asset_path([f"{UI_PATH}/Armor_full.png"]) or "white_cube"
+    armor_empty = resolve_existing_asset_path([f"{UI_PATH}/Armor_empty.png"]) or "white_cube"
+
+    # Usa ícones individuais com proporção quadrada para evitar aparência achatada.
+    icon_scale = (0.026, 0.026)
+    spacing = 0.030
+    hotbar_left = hotbar_bg.x - (hotbar_bg.scale_x / 2)
+    hotbar_top = hotbar_bg.y + (hotbar_bg.scale_y / 2)
+    start_x = hotbar_left + (icon_scale[0] * 0.5)
+
+    # Armadura em cima e corações abaixo, ambos acima da hotbar com margem pequena.
+    y_hearts = hotbar_top + 0.008 + (icon_scale[1] * 0.5)
+    y_armor = y_hearts + (icon_scale[1] * 1.15)
+
+    for i in range(10):
+        hud_heart_icons.append(
+            Entity(
+                parent=camera.ui,
+                model="quad",
+                texture=heart_full,
+                position=(start_x + (i * spacing), y_hearts, 0.8),
+                scale=icon_scale,
+                color=color.white,
+            )
+        )
+
+    for i in range(10):
+        hud_armor_icons.append(
+            Entity(
+                parent=camera.ui,
+                model="quad",
+                texture=armor_full if i < 8 else armor_empty,
+                position=(start_x + (i * spacing), y_armor, 0.8),
+                scale=icon_scale,
+                color=color.white,
+            )
+        )
+
+
 create_hotbar_ui()
 update_hotbar_ui()
+create_status_hud()
 
 flash = Entity(
     parent=camera.ui,
@@ -1120,6 +1344,14 @@ def respawn_flash():
 
 def input(key):
     global selected_block_index
+
+    if key == "f3":
+        fps_overlay_visible[0] = not fps_overlay_visible[0]
+        if fps_overlay is not None:
+            fps_overlay.enabled = fps_overlay_visible[0] and not is_game_paused()
+        if fps_overlay_text is not None:
+            fps_overlay_text.enabled = fps_overlay_visible[0] and not is_game_paused()
+        return
 
     if key == "escape":
         if menu:
@@ -1313,14 +1545,22 @@ def update():
     else:
         step_cooldown[0] = 0.0
 
-    light_update_timer[0] -= time.dt
-    if light_update_timer[0] <= 0:
-        refresh_active_block_lighting()
-        if highlighted_box[0] is not None:
-            highlight_box(highlighted_box[0])
-        light_update_timer[0] = 0.25
-
     was_grounded[0] = current_grounded
+
+    if (
+        fps_overlay_visible[0]
+        and fps_overlay is not None
+        and fps_overlay.enabled
+        and fps_overlay_text is not None
+        and fps_overlay_text.enabled
+    ):
+        fps_frames[0] += 1
+        fps_timer[0] += time.dt
+        if fps_timer[0] >= 0.25:
+            fps_value = int(round(fps_frames[0] / max(fps_timer[0], 1e-6)))
+            fps_overlay_text.text = f"FPS: {fps_value}"
+            fps_timer[0] = 0.0
+            fps_frames[0] = 0
 
 
 app.run()
