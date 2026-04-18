@@ -11,14 +11,15 @@ def test_inventory_toggle_is_bound_to_e_key():
     assert "set_inventory_open(not inventory_open[0])" in text
 
 
-def test_hotbar_uses_fixed_slot_count_mapping():
+def test_hotbar_keeps_fixed_slot_count_mapping():
     text = MAIN_PY.read_text(encoding="utf-8")
     assert "HOTBAR_SLOT_COUNT = 9" in text
     assert "hotbar_block_indices" in text
     assert "return BLOCK_TYPES[hotbar_block_indices[selected_block_index]]" in text
 
 
-def test_inventory_assignment_updates_selected_hotbar_slot():
+def test_inventory_hotbar_drag_updates_existing_hotbar():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "def assign_inventory_block_to_selected_slot(block_index):" in text
-    assert "hotbar_block_indices[selected_block_index] = block_index" in text
+    assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"])' in text
+    assert "inventory_hotbar_buttons.append(slot_button)" in text
+    assert 'hotbar_block_indices[target_index] = inventory_drag_block_index[0]' in text

@@ -4,6 +4,7 @@ import random
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 
+from panda3d.core import WindowProperties
 from ursina import (
     Audio,
     Button,
@@ -444,9 +445,34 @@ def _shutdown_desired_positions_executor():
 atexit.register(_shutdown_desired_positions_executor)
 
 
+def center_game_window():
+    if window.fullscreen:
+        return
+
+    try:
+        current_props = app.win.getProperties()
+        window_width = current_props.getXSize()
+        window_height = current_props.getYSize()
+        if window_width <= 0 or window_height <= 0:
+            return
+
+        display_width = app.pipe.getDisplayWidth()
+        display_height = app.pipe.getDisplayHeight()
+        origin_x = max(0, int((display_width - window_width) / 2))
+        origin_y = max(0, int((display_height - window_height) / 2))
+
+        props = WindowProperties()
+        props.setOrigin(origin_x, origin_y)
+        app.win.requestProperties(props)
+    except Exception:
+        pass
+
+
 def toggle_fullscreen():
     window.fullscreen = not window.fullscreen
     fullscreen_state[0] = window.fullscreen
+    if not window.fullscreen:
+        invoke(center_game_window, delay=0.05)
 
 
 def get_block_texture(block_type):
@@ -1198,22 +1224,17 @@ inventory_open = [False]
 inventory_panel = [None]
 inventory_backdrop = [None]
 inventory_card = [None]
-inventory_slots = []
-inventory_slot_frames = []
 inventory_slot_buttons = []
-inventory_group_buttons = []
-inventory_filtered_indices = [[]]
-inventory_search_query = [""]
-inventory_selected_group = ["all"]
-inventory_page = [0]
-inventory_search_text = [None]
-inventory_page_text = [None]
-inventory_group_label = [None]
-inventory_hotbar_bg = [None]
+inventory_slot_icons = []
+inventory_slot_block_indices = [[]]
 inventory_hotbar_selector = [None]
+inventory_hotbar_buttons = []
 inventory_hotbar_icons = []
+inventory_drag_icon = [None]
+inventory_drag_origin = [None]
+inventory_drag_block_index = [None]
 
-INVENTORY_COLUMNS = 8
+INVENTORY_COLUMNS = 9
 INVENTORY_ROWS = 3
 INVENTORY_PAGE_SIZE = INVENTORY_COLUMNS * INVENTORY_ROWS
 
@@ -1355,34 +1376,37 @@ def update_hotbar_ui():
     refresh_inventory_hotbar_preview()
 
 
+def set_selected_hotbar_slot(slot_index):
+    global selected_block_index
+    selected_block_index = max(0, min(slot_index, HOTBAR_SLOT_COUNT - 1))
+    update_hotbar_ui()
+
+
 def assign_inventory_block_to_selected_slot(block_index):
     hotbar_block_indices[selected_block_index] = block_index
     update_hotbar_ui()
     refresh_inventory_grid()
 
 
-def get_inventory_group_for_block(block_type):
-    texture_name = block_type.get("block_texture", "").lower()
-    material = block_type.get("material", "")
+def inventory_pixel_to_local(x_px, y_px, z=-0.02):
+    return Vec3((x_px / 256) - 0.5, 0.5 - (y_px / 256), z)
 
-    if any(token in texture_name for token in ("ore", "diamond", "emerald", "iron", "gold", "copper", "lapis", "redstone", "deepslate")):
-        return "minerios"
-    if any(token in texture_name for token in ("wood", "plank", "log", "acacia", "spruce", "birch", "mangrove", "bamboo")):
-        return "madeira"
-    if any(token in texture_name for token in ("grass", "dirt", "leaf", "leaves", "moss", "mud")) or material == "grass":
-        return "natureza"
-    if any(token in texture_name for token in ("terracotta", "glazed", "brick", "polished", "chiseled", "wool", "glass")):
-        return "decoracao"
-    return "pedra"
+
+def get_inventory_grid_slot_position(slot_index):
+    col = slot_index % INVENTORY_COLUMNS
+    row = slot_index // INVENTORY_COLUMNS
+    return inventory_pixel_to_local(17 + (col * 18), 93 + (row * 18))
+
+
+def get_inventory_hotbar_slot_position(slot_index):
+    return inventory_pixel_to_local(17 + (slot_index * 18), 151)
 
 
 def refresh_inventory_hotbar_preview():
-    if inventory_hotbar_bg[0] is None or inventory_hotbar_selector[0] is None:
+    if inventory_hotbar_selector[0] is None:
         return
 
-    slot_spacing = inventory_hotbar_bg[0].scale_x * (40 / 364)
-    selector_start_x = -(inventory_hotbar_bg[0].scale_x / 2) + (inventory_hotbar_bg[0].scale_x * (21.5 / 364))
-    inventory_hotbar_selector[0].x = selector_start_x + (selected_block_index * slot_spacing)
+    inventory_hotbar_selector[0].position = get_inventory_hotbar_slot_position(selected_block_index)
 
     for slot_index, icon in enumerate(inventory_hotbar_icons):
         block_index = hotbar_block_indices[slot_index]
@@ -1390,73 +1414,102 @@ def refresh_inventory_hotbar_preview():
 
 
 def refresh_inventory_grid():
-    if not inventory_slot_buttons:
+    if not inventory_slot_icons:
         return
 
-    query = inventory_search_query[0].strip().lower()
-    selected_group = inventory_selected_group[0]
+    visible_indices = list(range(min(INVENTORY_PAGE_SIZE, len(BLOCK_TYPES))))
+    inventory_slot_block_indices[0] = visible_indices
 
-    filtered = []
-    for idx, block_type in enumerate(BLOCK_TYPES):
-        block_group = get_inventory_group_for_block(block_type)
-        if selected_group != "all" and block_group != selected_group:
-            continue
+    for slot_index, icon in enumerate(inventory_slot_icons):
+        has_block = slot_index < len(visible_indices)
+        inventory_slot_buttons[slot_index].enabled = has_block
+        inventory_slot_buttons[slot_index].visible = has_block
+        icon.enabled = has_block
+        if has_block:
+            block_index = visible_indices[slot_index]
+            icon.texture = get_block_icon_texture(BLOCK_TYPES[block_index])
 
-        candidate_text = f"{block_type.get('name', '')} {block_type.get('block_texture', '')}".lower()
-        if query and query not in candidate_text:
-            continue
-        filtered.append(idx)
+    refresh_inventory_hotbar_preview()
 
-    inventory_filtered_indices[0] = filtered
-    total_pages = max(1, math.ceil(len(filtered) / INVENTORY_PAGE_SIZE))
-    inventory_page[0] = max(0, min(inventory_page[0], total_pages - 1))
 
-    start = inventory_page[0] * INVENTORY_PAGE_SIZE
-    end = start + INVENTORY_PAGE_SIZE
-    page_items = filtered[start:end]
+def get_inventory_hovered_slot():
+    for slot_index, button in enumerate(inventory_hotbar_buttons):
+        if button.hovered:
+            return ("hotbar", slot_index)
 
-    for slot_idx, button in enumerate(inventory_slot_buttons):
-        frame = inventory_slot_frames[slot_idx]
-        if slot_idx < len(page_items):
-            block_index = page_items[slot_idx]
-            block_type = BLOCK_TYPES[block_index]
-            frame.enabled = True
-            button.enabled = True
-            button.visible = True
-            button.texture = get_block_icon_texture(block_type)
-            button.on_click = (lambda idx=block_index: assign_inventory_block_to_selected_slot(idx))
-            if block_index == hotbar_block_indices[selected_block_index]:
-                frame.texture = resolve_existing_asset_path([f"{UI_PATH}/GUI_slot_highlight_back.png", f"{UI_PATH}/GUI_slot.png"]) or "white_cube"
-            else:
-                frame.texture = resolve_existing_asset_path([f"{UI_PATH}/GUI_slot.png"]) or "white_cube"
+    for slot_index, button in enumerate(inventory_slot_buttons):
+        if button.enabled and button.hovered:
+            return ("inventory", slot_index)
+
+    return (None, None)
+
+
+def clear_inventory_drag():
+    inventory_drag_origin[0] = None
+    inventory_drag_block_index[0] = None
+    if inventory_drag_icon[0] is not None:
+        inventory_drag_icon[0].enabled = False
+
+
+def start_inventory_drag():
+    slot_kind, slot_index = get_inventory_hovered_slot()
+    if slot_kind is None:
+        return False
+
+    if slot_kind == "inventory":
+        visible_indices = inventory_slot_block_indices[0]
+        if slot_index >= len(visible_indices):
+            return False
+        block_index = visible_indices[slot_index]
+    else:
+        block_index = hotbar_block_indices[slot_index]
+        set_selected_hotbar_slot(slot_index)
+
+    inventory_drag_origin[0] = (slot_kind, slot_index)
+    inventory_drag_block_index[0] = block_index
+
+    if inventory_drag_icon[0] is not None:
+        inventory_drag_icon[0].texture = get_block_icon_texture(BLOCK_TYPES[block_index])
+        inventory_drag_icon[0].position = Vec3(mouse.position[0], mouse.position[1], -0.35)
+        inventory_drag_icon[0].enabled = True
+
+    return True
+
+
+def finish_inventory_drag():
+    if inventory_drag_origin[0] is None or inventory_drag_block_index[0] is None:
+        return False
+
+    origin_kind, origin_index = inventory_drag_origin[0]
+    target_kind, target_index = get_inventory_hovered_slot()
+
+    if target_kind == "hotbar":
+        if origin_kind == "hotbar":
+            hotbar_block_indices[origin_index], hotbar_block_indices[target_index] = (
+                hotbar_block_indices[target_index],
+                hotbar_block_indices[origin_index],
+            )
         else:
-            frame.enabled = True
-            frame.texture = resolve_existing_asset_path([f"{UI_PATH}/Disabled_slot.png", f"{UI_PATH}/GUI_slot.png"]) or "white_cube"
-            button.enabled = False
-            button.visible = False
+            hotbar_block_indices[target_index] = inventory_drag_block_index[0]
+        set_selected_hotbar_slot(target_index)
+        update_hotbar_ui()
+    elif target_kind == "inventory" and origin_kind == "hotbar":
+        visible_indices = inventory_slot_block_indices[0]
+        if target_index < len(visible_indices):
+            hotbar_block_indices[origin_index] = visible_indices[target_index]
+            set_selected_hotbar_slot(origin_index)
+            update_hotbar_ui()
 
-    if inventory_search_text[0] is not None:
-        inventory_search_text[0].text = "Buscar"
-
-
-def set_inventory_group(group_key):
-    inventory_selected_group[0] = group_key
-    inventory_page[0] = 0
+    clear_inventory_drag()
     refresh_inventory_grid()
-
-
-def next_inventory_page(delta):
-    filtered_count = len(inventory_filtered_indices[0])
-    total_pages = max(1, math.ceil(filtered_count / INVENTORY_PAGE_SIZE))
-    inventory_page[0] = (inventory_page[0] + delta) % total_pages
-    refresh_inventory_grid()
+    return True
 
 
 def create_inventory_ui():
     inventory_backdrop[0] = Entity(
         parent=camera.ui,
         model="quad",
-        color=color.rgba(9, 13, 20, 105),
+        color=color.rgba(0, 0, 0, 150),
         scale=(2.0, 2.0),
         z=0.45,
         enabled=False,
@@ -1464,7 +1517,6 @@ def create_inventory_ui():
 
     inventory_panel[0] = Entity(
         parent=camera.ui,
-        model="quad",
         color=color.rgba(0, 0, 0, 0),
         scale=(1.0, 1.0),
         z=0.44,
@@ -1474,153 +1526,80 @@ def create_inventory_ui():
     inventory_card[0] = Entity(
         parent=inventory_panel[0],
         model="quad",
-        texture=resolve_existing_asset_path([f"{UI_PATH}/inventory.png", f"{UI_PATH}/Inworld_menu_list_background.png"]) or "white_cube",
-        color=color.rgba(255, 255, 255, 255),
-        scale=(0.86, 0.66),
+        texture=resolve_existing_asset_path([f"{UI_PATH}/inventory.png"]) or "white_cube",
+        color=color.white,
+        scale=(0.72, 0.72),
         z=0,
     )
 
-    inventory_search_text[0] = Text(
-        parent=inventory_card[0],
-        text="Buscar",
-        position=(-0.37, 0.21, 0),
-        scale=1.15,
-        color=color.rgb(50, 50, 50),
-    )
-
-    Entity(
-        parent=inventory_card[0],
-        model="quad",
-        texture=resolve_existing_asset_path([f"{UI_PATH}/Text_field.png"]) or "white_cube",
-        color=color.rgba(255, 255, 255, 255),
-        scale=(0.52, 0.062),
-        position=(-0.01, 0.215, 0),
-    )
-
-    group_options = [
-        ("all", 0),
-        ("natureza", 1),
-        ("madeira", 2),
-        ("pedra", 3),
-        ("minerios", 4),
-        ("decoracao", 5),
-    ]
-    tab_textures = {
-        "all": resolve_existing_asset_path([f"{UI_PATH}/Creative_tab_items_gui.png", f"{UI_PATH}/GUI_slot.png"]) or "white_cube",
-        "natureza": get_block_icon_texture(BLOCK_TYPES[0]),
-        "madeira": get_block_icon_texture(BLOCK_TYPES[1 if len(BLOCK_TYPES) > 1 else 0]),
-        "pedra": get_block_icon_texture(BLOCK_TYPES[2 if len(BLOCK_TYPES) > 2 else 0]),
-        "minerios": get_block_icon_texture(BLOCK_TYPES[min(3, len(BLOCK_TYPES) - 1)]),
-        "decoracao": get_block_icon_texture(BLOCK_TYPES[min(4, len(BLOCK_TYPES) - 1)]),
-    }
-    for group_key, idx in group_options:
-        group_button = Button(
-            parent=inventory_card[0],
-            model="quad",
-            texture=resolve_existing_asset_path([f"{UI_PATH}/GUI_slot.png"]) or "white_cube",
-            color=color.rgba(255, 255, 255, 255),
-            text="",
-            scale=(0.072, 0.072),
-            position=(-0.34 + (idx * 0.11), 0.13, 0),
-            highlight_color=color.rgba(248, 248, 248, 255),
-            pressed_color=color.rgba(224, 224, 224, 255),
-        )
-        Entity(
-            parent=group_button,
-            model="quad",
-            texture=tab_textures[group_key],
-            color=color.white,
-            scale=(0.78, 0.78),
-            position=(0, 0, -0.01),
-        )
-        group_button.on_click = (lambda g=group_key: set_inventory_group(g))
-        inventory_group_buttons.append(group_button)
-
-    prev_button = Button(
-        parent=inventory_card[0],
-        model="quad",
-        texture=resolve_existing_asset_path([f"{UI_PATH}/Sort_down.png", f"{UI_PATH}/GUI_slot.png"]) or "white_cube",
-        color=color.rgba(255, 255, 255, 255),
-        text="",
-        scale=(0.07, 0.07),
-        position=(0.30, -0.27, 0),
-    )
-    prev_button.on_click = lambda: next_inventory_page(-1)
-
-    next_button = Button(
-        parent=inventory_card[0],
-        model="quad",
-        texture=resolve_existing_asset_path([f"{UI_PATH}/Sort_up.png", f"{UI_PATH}/GUI_slot.png"]) or "white_cube",
-        color=color.rgba(255, 255, 255, 255),
-        text="",
-        scale=(0.07, 0.07),
-        position=(0.39, -0.27, 0),
-    )
-    next_button.on_click = lambda: next_inventory_page(1)
-
-    inventory_hotbar_bg[0] = Entity(
-        parent=inventory_card[0],
-        model="quad",
-        texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar.png"]) or "white_cube",
-        position=(0.00, -0.28, 0),
-        scale=(0.54, 0.070),
-    )
     inventory_hotbar_selector[0] = Entity(
-        parent=inventory_hotbar_bg[0],
+        parent=inventory_card[0],
         model="quad",
         texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"]) or "white_cube",
-        position=(0, 0, -0.01),
-        scale=(0.066, 0.078),
+        color=color.white,
+        scale=(24 / 256, 24 / 256),
+        position=get_inventory_hotbar_slot_position(selected_block_index),
+        z=-0.03,
     )
 
-    preview_slot_spacing = inventory_hotbar_bg[0].scale_x * (40 / 364)
-    preview_start_x = -(inventory_hotbar_bg[0].scale_x / 2) + (inventory_hotbar_bg[0].scale_x * (21.5 / 364))
-    preview_icon_scale = (preview_slot_spacing * 0.76, inventory_hotbar_bg[0].scale_y * 0.72)
     for slot_idx in range(HOTBAR_SLOT_COUNT):
+        slot_button = Button(
+            parent=inventory_card[0],
+            model="quad",
+            texture="white_cube",
+            color=color.rgba(255, 255, 255, 1),
+            scale=(18 / 256, 18 / 256),
+            position=get_inventory_hotbar_slot_position(slot_idx),
+            text="",
+            highlight_color=color.rgba(255, 255, 255, 18),
+            pressed_color=color.rgba(255, 255, 255, 36),
+        )
+        inventory_hotbar_buttons.append(slot_button)
         inventory_hotbar_icons.append(
             Entity(
-                parent=inventory_hotbar_bg[0],
+                parent=slot_button,
                 model="quad",
                 texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[slot_idx]]),
-                position=(preview_start_x + (slot_idx * preview_slot_spacing), 0.001, -0.02),
-                scale=preview_icon_scale,
+                position=(0, 0, -0.02),
+                scale=16 / 18,
                 color=color.white,
             )
         )
 
-    slot_spacing_x = 0.095
-    slot_spacing_y = 0.107
-    grid_start_x = -0.335
-    grid_start_y = 0.04
     for slot_idx in range(INVENTORY_PAGE_SIZE):
-        col = slot_idx % INVENTORY_COLUMNS
-        row = slot_idx // INVENTORY_COLUMNS
-        position = (grid_start_x + (col * slot_spacing_x), grid_start_y - (row * slot_spacing_y), 0)
-
-        slot_frame = Entity(
+        slot_button = Button(
             parent=inventory_card[0],
             model="quad",
-            texture=resolve_existing_asset_path([f"{UI_PATH}/GUI_slot.png"]) or "white_cube",
-            color=color.white,
-            scale=(0.084, 0.084),
-            position=position,
-        )
-
-        slot_button = Button(
-            parent=slot_frame,
-            model="quad",
             texture="white_cube",
-            color=color.white,
-            scale=(0.76, 0.76),
-            position=(0, 0, -0.01),
+            color=color.rgba(255, 255, 255, 1),
+            scale=(18 / 256, 18 / 256),
+            position=get_inventory_grid_slot_position(slot_idx),
             text="",
-            highlight_color=color.rgba(255, 255, 255, 28),
-            pressed_color=color.rgba(255, 255, 255, 70),
+            highlight_color=color.rgba(255, 255, 255, 18),
+            pressed_color=color.rgba(255, 255, 255, 36),
+        )
+        inventory_slot_buttons.append(slot_button)
+        inventory_slot_icons.append(
+            Entity(
+                parent=slot_button,
+                model="quad",
+                texture="white_cube",
+                position=(0, 0, -0.02),
+                scale=16 / 18,
+                color=color.white,
+            )
         )
 
-        inventory_slot_frames.append(slot_frame)
-        inventory_slot_buttons.append(slot_button)
-        inventory_slots.append(slot_button)
+    drag_scale = inventory_card[0].scale_x * (16 / 256)
+    inventory_drag_icon[0] = Entity(
+        parent=camera.ui,
+        model="quad",
+        texture="white_cube",
+        scale=(drag_scale, drag_scale),
+        color=color.white,
+        z=-0.35,
+        enabled=False,
+    )
 
     refresh_inventory_hotbar_preview()
     refresh_inventory_grid()
@@ -1644,9 +1623,9 @@ def set_inventory_open(state):
         mouse.locked = should_enable_player
         if crosshair is not None:
             crosshair.enabled = should_enable_player
+        clear_inventory_drag()
         return
 
-    # Sempre que abrir, atualiza conteúdo visual com filtros atuais.
     refresh_inventory_hotbar_preview()
     refresh_inventory_grid()
 
@@ -1696,6 +1675,7 @@ create_hotbar_ui()
 update_hotbar_ui()
 create_status_hud()
 create_inventory_ui()
+invoke(center_game_window, delay=0.05)
 
 flash = Entity(
     parent=camera.ui,
@@ -1744,42 +1724,24 @@ def input(key):
     if key.isdigit():
         idx = int(key) - 1
         if 0 <= idx < HOTBAR_SLOT_COUNT:
-            selected_block_index = idx
-            update_hotbar_ui()
+            set_selected_hotbar_slot(idx)
             return
 
     if inventory_open[0]:
-        if key == "left arrow":
-            next_inventory_page(-1)
+        if key == "left mouse down":
+            start_inventory_drag()
             return
-        if key == "right arrow":
-            next_inventory_page(1)
-            return
-        if key == "backspace":
-            inventory_search_query[0] = inventory_search_query[0][:-1]
-            inventory_page[0] = 0
-            refresh_inventory_grid()
-            return
-        if key == "space":
-            inventory_search_query[0] += " "
-            inventory_page[0] = 0
-            refresh_inventory_grid()
-            return
-        if len(key) == 1 and (key.isalnum() or key in ("_", "-")):
-            inventory_search_query[0] += key.lower()
-            inventory_page[0] = 0
-            refresh_inventory_grid()
+        if key == "left mouse up":
+            finish_inventory_drag()
             return
         return
 
     if key == "scroll up":
-        selected_block_index = (selected_block_index + 1) % HOTBAR_SLOT_COUNT
-        update_hotbar_ui()
+        set_selected_hotbar_slot((selected_block_index + 1) % HOTBAR_SLOT_COUNT)
         return
 
     if key == "scroll down":
-        selected_block_index = (selected_block_index - 1) % HOTBAR_SLOT_COUNT
-        update_hotbar_ui()
+        set_selected_hotbar_slot((selected_block_index - 1) % HOTBAR_SLOT_COUNT)
         return
 
     if key == "space":
@@ -1813,6 +1775,8 @@ def input(key):
 def update():
     sync_active_blocks()
     update_highlight()
+    if inventory_open[0] and inventory_drag_icon[0] is not None and inventory_drag_icon[0].enabled:
+        inventory_drag_icon[0].position = Vec3(mouse.position[0], mouse.position[1], -0.35)
     if not is_game_paused():
         update_ambient_mobs()
         update_chicken_walking()

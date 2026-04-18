@@ -5,27 +5,24 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 MAIN_PY = BASE_DIR / "main.py"
 
 
-def test_inventory_uses_existing_ui_slot_assets():
+def test_inventory_uses_centered_inventory_texture_with_27_slots():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert 'GUI_slot.png' in text
-    assert 'Hotbar.png' in text
-    assert 'Hotbar_selector.png' in text
+    assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/inventory.png"])' in text
+    assert "INVENTORY_COLUMNS = 9" in text
+    assert "INVENTORY_ROWS = 3" in text
+    assert "INVENTORY_PAGE_SIZE = INVENTORY_COLUMNS * INVENTORY_ROWS" in text
 
 
-def test_inventory_has_grouping_and_filter_helpers():
+def test_inventory_slot_positions_match_minecraft_layout():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "def get_inventory_group_for_block(block_type):" in text
-    assert "def set_inventory_group(group_key):" in text
-    assert '("natureza", 1)' in text
-    assert '("minerios", 4)' in text
-    assert "tab_textures" in text
+    assert "def get_inventory_grid_slot_position(slot_index):" in text
+    assert "return inventory_pixel_to_local(17 + (slot_index * 18), 151)" in text
+    assert "return inventory_pixel_to_local(17 + (col * 18), 93 + (row * 18))" in text
 
 
-def test_inventory_has_pagination_and_search_input():
+def test_inventory_supports_drag_and_drop_to_hotbar():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "INVENTORY_PAGE_SIZE" in text
-    assert "def next_inventory_page(delta):" in text
-    assert 'if key == "left arrow":' in text
-    assert 'if key == "right arrow":' in text
-    assert 'if key == "backspace":' in text
-    assert "inventory_search_query" in text
+    assert "def start_inventory_drag():" in text
+    assert "def finish_inventory_drag():" in text
+    assert 'if key == "left mouse down":' in text
+    assert 'if key == "left mouse up":' in text
