@@ -1597,11 +1597,11 @@ def inventory_slot_icon_scale():
 def get_inventory_grid_slot_position(slot_index):
     col = slot_index % INVENTORY_COLUMNS
     row = slot_index // INVENTORY_COLUMNS
-    return inventory_pixel_to_local(16.5 + (col * 18), 92.5 + (row * 18))
+    return inventory_pixel_to_local(15.5 + (col * 18), 91.5 + (row * 18))
 
 
 def get_inventory_hotbar_slot_position(slot_index):
-    return inventory_pixel_to_local(16.5 + (slot_index * 18), 150.5)
+    return inventory_pixel_to_local(16.5 + (slot_index * 18), 149.5)
 
 
 def refresh_inventory_hotbar_preview():
