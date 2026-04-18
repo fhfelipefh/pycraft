@@ -22,3 +22,11 @@ def test_render_distance_was_increased():
     text = MAIN_PY.read_text(encoding="utf-8")
     assert "RENDER_RADIUS = 28" in text
     assert "CUSTOM_RENDER_RADIUS = 84" in text
+
+
+def test_mobs_are_paused_when_menu_is_open():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert "def is_game_paused():" in text
+    assert "if not is_game_paused():" in text
+    assert "update_ambient_mobs()" in text
+    assert "update_chicken_walking()" in text

@@ -1014,6 +1014,10 @@ def on_menu_toggle(state):
     pass
 
 
+def is_game_paused():
+    return bool(menu and menu.menu_open)
+
+
 menu = GameMenu(player, on_menu_toggle, toggle_fullscreen)
 
 hotbar_bg = Entity(
@@ -1137,8 +1141,9 @@ def input(key):
 def update():
     sync_active_blocks()
     update_highlight()
-    update_ambient_mobs()
-    update_chicken_walking()
+    if not is_game_paused():
+        update_ambient_mobs()
+        update_chicken_walking()
 
     is_running = bool(
         held_keys.get("control")
