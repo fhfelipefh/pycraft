@@ -60,6 +60,7 @@ RENDER_RADIUS = 30
 RENDER_HEIGHT = 12
 CUSTOM_RENDER_RADIUS = 88
 CUSTOM_RENDER_HEIGHT = 24
+RENDER_UNLOAD_PADDING = 1
 PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
 CLOUD_CYCLE_SECONDS = 9 * 60
@@ -67,6 +68,9 @@ BLOCK_INTERACTION_RANGE = 20
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
+MOB_STEP_HEIGHT = 1.15
+MOB_FALL_SPEED = 7.5
+MOB_RESPAWN_FALL_DISTANCE = 18.0
 
 
 def resolve_asset_path(relative_path):
@@ -191,6 +195,17 @@ def get_entity_model_min_y(entity):
     return -0.5
 
 
+def get_entity_model_max_y(entity):
+    try:
+        tight_bounds = entity.model.get_tight_bounds()
+        if tight_bounds:
+            _, max_point = tight_bounds
+            return float(max_point.y)
+    except Exception:
+        pass
+    return 0.5
+
+
 def get_support_top_y_under_entity(entity, probe_height=6.0, probe_distance=24.0):
     hit = raycast(
         Vec3(entity.x, entity.y + probe_height, entity.z),
@@ -221,6 +236,55 @@ def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
         entity.y = grounded_y
         return True
     return False
+
+
+def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footprint=0.5):
+    ignore = (ignore_entity,) if ignore_entity is not None else ()
+    hit = raycast(
+        Vec3(x, probe_from_y, z),
+        Vec3(0, -1, 0),
+        distance=max(4.0, probe_from_y - (GROUND_Y - 8.0)),
+        ignore=ignore,
+    )
+    if hit.hit and hasattr(hit.entity, "block_type"):
+        return float(hit.world_point.y)
+
+    top = None
+    min_x = math.floor(x - footprint)
+    max_x = math.ceil(x + footprint)
+    min_z = math.floor(z - footprint)
+    max_z = math.ceil(z + footprint)
+    max_y = math.ceil(probe_from_y)
+
+    for bx in range(min_x, max_x + 1):
+        for bz in range(min_z, max_z + 1):
+            if abs(bx - x) > footprint or abs(bz - z) > footprint:
+                continue
+            for by in range(GROUND_Y, max_y + 1):
+                if get_block_type_at((bx, by, bz)) is None:
+                    continue
+                candidate_top = by + 1.0
+                if top is None or candidate_top > top:
+                    top = candidate_top
+
+    return top
+
+
+def get_grounded_y_for_entity_at(entity, x, z, probe_from_y=None, footprint=0.5, epsilon=0.01):
+    probe_y = probe_from_y if probe_from_y is not None else max(entity.y + 6.0, GROUND_Y + 8.0)
+    support_top = get_support_top_y_at_position(
+        x,
+        z,
+        probe_y,
+        ignore_entity=entity,
+        footprint=footprint,
+    )
+    return compute_grounded_entity_y(
+        get_entity_model_min_y(entity),
+        getattr(entity, "scale_y", 1.0) or 1.0,
+        support_top,
+        epsilon=epsilon,
+    )
 
 BLOCK_TYPES = [
     {
@@ -491,6 +555,14 @@ def to_grid_position(position):
     return tuple(int(round(value)) for value in position)
 
 
+def get_render_cell(position):
+    return (
+        math.floor(position.x),
+        int(round(position.y)),
+        math.floor(position.z),
+    )
+
+
 def play_sound_group(group_name, event_name):
     group = SOUND_GROUPS.get(group_name, {})
     sound_data = group.get(event_name)
@@ -628,6 +700,26 @@ def get_desired_positions(render_cell):
     return desired
 
 
+def should_keep_block_loaded(position, render_cell):
+    if render_cell is None:
+        return False
+
+    px, py, pz = render_cell
+    x, y, z = position
+
+    if y == GROUND_Y:
+        return (
+            abs(x - px) <= (RENDER_RADIUS + RENDER_UNLOAD_PADDING)
+            and abs(z - pz) <= (RENDER_RADIUS + RENDER_UNLOAD_PADDING)
+        )
+
+    return (
+        abs(x - px) <= (CUSTOM_RENDER_RADIUS + RENDER_UNLOAD_PADDING)
+        and abs(y - py) <= (CUSTOM_RENDER_HEIGHT + RENDER_UNLOAD_PADDING)
+        and abs(z - pz) <= (CUSTOM_RENDER_RADIUS + RENDER_UNLOAD_PADDING)
+    )
+
+
 def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_positions):
     if render_cell is None:
         return set()
@@ -667,7 +759,7 @@ desired_positions_scheduler[0] = DesiredPositionsScheduler(
 
 
 def sync_active_blocks(force=False):
-    render_cell = to_grid_position(player.position)
+    render_cell = get_render_cell(player.position)
     if not force and render_cell == last_render_cell[0]:
         return
 
@@ -686,6 +778,8 @@ def sync_active_blocks(force=False):
     current_positions = set(active_blocks)
 
     for position in current_positions - desired_positions:
+        if should_keep_block_loaded(position, render_cell):
+            continue
         remove_block_entity(position)
 
     for position in desired_positions - current_positions:
@@ -890,40 +984,44 @@ chicken_right_wing = Entity(
 )
 
 
-def mob_position_is_blocked(position, player_radius=0.75):
-    if position.y < GROUND_Y + 0.05:
-        return True
-
+def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint=0.48):
     player_distance = Vec3(position.x - player.x, 0, position.z - player.z).length()
     if player_distance < player_radius and abs(position.y - player.y) < 1.4:
         return True
 
-    # Evita varrer todos os blocos ativos por frame: verifica apenas células vizinhas.
-    min_x = math.floor(position.x - 0.48)
-    max_x = math.ceil(position.x + 0.48)
-    min_z = math.floor(position.z - 0.48)
-    max_z = math.ceil(position.z + 0.48)
-    min_y = math.floor(position.y - 1.2)
-    max_y = math.ceil(position.y + 1.2)
+    model_min_y = get_entity_model_min_y(entity) if entity is not None else -0.5
+    model_max_y = get_entity_model_max_y(entity) if entity is not None else 0.5
+    scale_y = getattr(entity, "scale_y", 1.0) if entity is not None else 1.0
+    body_bottom = position.y + (model_min_y * scale_y) + 0.04
+    body_top = position.y + (model_max_y * scale_y) - 0.04
+
+    min_x = math.floor(position.x - footprint)
+    max_x = math.ceil(position.x + footprint)
+    min_z = math.floor(position.z - footprint)
+    max_z = math.ceil(position.z + footprint)
+    min_y = math.floor(body_bottom)
+    max_y = math.ceil(body_top)
 
     for bx in range(min_x, max_x + 1):
         for bz in range(min_z, max_z + 1):
-            if abs(bx - position.x) >= 0.48 or abs(bz - position.z) >= 0.48:
+            if abs(bx - position.x) > footprint or abs(bz - position.z) > footprint:
                 continue
 
             for by in range(min_y, max_y + 1):
-                # Chão base não deve bloquear o deslocamento horizontal do mob.
-                if by <= GROUND_Y:
+                if get_block_type_at((bx, by, bz)) is None:
                     continue
 
-                if get_block_type_at((bx, by, bz)) is not None:
-                    return True
+                block_bottom = float(by)
+                block_top = block_bottom + 1.0
+                if block_top <= body_bottom or block_bottom >= body_top:
+                    continue
+                return True
 
     return False
 
 
 def chicken_position_is_blocked(position):
-    return mob_position_is_blocked(position, player_radius=0.75)
+    return mob_position_is_blocked(position, entity=chicken, player_radius=0.75)
 
 
 def update_chicken_animation(move_amount):
@@ -940,7 +1038,6 @@ def update_chicken_animation(move_amount):
     chicken_right_wing.rotation_z = -wing_swing
 
     chicken_body_bob[0] = bob
-    chicken.y = chicken_spawn_position.y
     chicken.rotation_z = math.sin(chicken_animation_time[0] * 0.7) * 1.4
 
 
@@ -1031,10 +1128,76 @@ def get_new_mob_walk_target(mob_state):
     return Vec3(spawn.x + offset_x, spawn.y, spawn.z + offset_z)
 
 
+def apply_mob_gravity(entity, fallback_position=None, footprint=0.5):
+    grounded_y = get_grounded_y_for_entity_at(
+        entity,
+        entity.x,
+        entity.z,
+        probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+        footprint=footprint,
+    )
+    if grounded_y is None:
+        entity.y -= MOB_FALL_SPEED * time.dt
+        if fallback_position is not None and entity.y < fallback_position.y - MOB_RESPAWN_FALL_DISTANCE:
+            entity.position = Vec3(fallback_position.x, fallback_position.y, fallback_position.z)
+            grounded_y = get_grounded_y_for_entity_at(
+                entity,
+                entity.x,
+                entity.z,
+                probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+                footprint=footprint,
+            )
+            if grounded_y is not None:
+                entity.y = grounded_y
+        return grounded_y
+
+    if grounded_y < entity.y:
+        entity.y = max(grounded_y, entity.y - (MOB_FALL_SPEED * time.dt))
+    else:
+        entity.y = grounded_y
+    return grounded_y
+
+
+def move_entity_with_grounding(entity, next_x, next_z, fallback_position=None, player_radius=0.75, footprint=0.5):
+    target_grounded_y = get_grounded_y_for_entity_at(
+        entity,
+        next_x,
+        next_z,
+        probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+        footprint=footprint,
+    )
+
+    if target_grounded_y is not None:
+        step_up = target_grounded_y - entity.y
+        if step_up > MOB_STEP_HEIGHT:
+            return False, None
+        candidate_position = Vec3(next_x, target_grounded_y, next_z)
+    else:
+        candidate_position = Vec3(next_x, entity.y, next_z)
+
+    if mob_position_is_blocked(candidate_position, entity=entity, player_radius=player_radius, footprint=footprint):
+        return False, target_grounded_y
+
+    entity.position = candidate_position
+    grounded_y = apply_mob_gravity(
+        entity,
+        fallback_position=fallback_position,
+        footprint=footprint,
+    )
+    return True, grounded_y
+
+
 def update_generic_mob_walk(mob_state):
     mob = mob_state["entity"]
     target = mob_state["target"][0]
-    ground_y = mob_state.get("grounded_y", mob_state["spawn"].y)
+    fallback_position = mob_state["spawn"]
+    grounded_y = apply_mob_gravity(
+        mob,
+        fallback_position=fallback_position,
+        footprint=0.52,
+    )
+    if grounded_y is not None:
+        mob_state["grounded_y"] = grounded_y
 
     if target is None:
         set_mob_animation(mob_state, "idle")
@@ -1054,34 +1217,45 @@ def update_generic_mob_walk(mob_state):
     direction = to_target.normalized()
     set_mob_animation(mob_state, "walk")
     step_distance = mob_state["walk_speed"] * time.dt
-    next_position = Vec3(
+    moved, grounded_y = move_entity_with_grounding(
+        mob,
         mob.x + (direction.x * step_distance),
-        ground_y,
         mob.z + (direction.z * step_distance),
+        fallback_position=fallback_position,
+        player_radius=mob_state["player_radius"],
+        footprint=0.52,
     )
 
-    if mob_position_is_blocked(next_position, player_radius=mob_state["player_radius"]):
-        x_only_position = Vec3(next_position.x, ground_y, mob.z)
-        z_only_position = Vec3(mob.x, ground_y, next_position.z)
+    if not moved:
+        moved, grounded_y = move_entity_with_grounding(
+            mob,
+            mob.x + (direction.x * step_distance),
+            mob.z,
+            fallback_position=fallback_position,
+            player_radius=mob_state["player_radius"],
+            footprint=0.52,
+        )
+    if not moved:
+        moved, grounded_y = move_entity_with_grounding(
+            mob,
+            mob.x,
+            mob.z + (direction.z * step_distance),
+            fallback_position=fallback_position,
+            player_radius=mob_state["player_radius"],
+            footprint=0.52,
+        )
+    if not moved:
+        mob_state["target"][0] = get_new_mob_walk_target(mob_state)
+        return
 
-        if not mob_position_is_blocked(x_only_position, player_radius=mob_state["player_radius"]):
-            mob.x = x_only_position.x
-        elif not mob_position_is_blocked(z_only_position, player_radius=mob_state["player_radius"]):
-            mob.z = z_only_position.z
-        else:
-            mob_state["target"][0] = get_new_mob_walk_target(mob_state)
-            return
-    else:
-        mob.position = next_position
+    if grounded_y is not None:
+        mob_state["grounded_y"] = grounded_y
 
     if direction.length() > 0:
         mob.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
 
     mob_state["animation_time"][0] += time.dt * (2.2 + (step_distance * 5.0))
     mob.rotation_z = math.sin(mob_state["animation_time"][0] * 0.45) * 1.2
-    if lift_entity_out_of_blocks(mob):
-        mob_state["grounded_y"] = mob.y
-        mob_state["spawn"] = Vec3(mob_state["spawn"].x, mob.y, mob_state["spawn"].z)
 
 
 def update_ambient_mobs():
@@ -1147,6 +1321,11 @@ ambient_mob_states = {
 
 def update_chicken_walking():
     target = chicken_walk_target[0]
+    apply_mob_gravity(
+        chicken,
+        fallback_position=chicken_spawn_position,
+        footprint=0.42,
+    )
     if target is None:
         chicken_walk_target[0] = get_new_chicken_walk_target()
         return
@@ -1160,26 +1339,36 @@ def update_chicken_walking():
 
     direction = to_target.normalized()
     step_distance = chicken_walk_speed * time.dt
-    next_position = Vec3(
+    moved, _ = move_entity_with_grounding(
+        chicken,
         chicken.x + (direction.x * step_distance),
-        chicken_spawn_position.y,
         chicken.z + (direction.z * step_distance),
+        fallback_position=chicken_spawn_position,
+        player_radius=0.75,
+        footprint=0.42,
     )
-
-    if chicken_position_is_blocked(next_position):
-        x_only_position = Vec3(next_position.x, chicken_spawn_position.y, chicken.z)
-        z_only_position = Vec3(chicken.x, chicken_spawn_position.y, next_position.z)
-
-        if not chicken_position_is_blocked(x_only_position):
-            chicken.x = x_only_position.x
-        elif not chicken_position_is_blocked(z_only_position):
-            chicken.z = z_only_position.z
-        else:
-            chicken_walk_target[0] = get_new_chicken_walk_target()
-            update_chicken_animation(0.0)
-            return
-    else:
-        chicken.position = next_position
+    if not moved:
+        moved, _ = move_entity_with_grounding(
+            chicken,
+            chicken.x + (direction.x * step_distance),
+            chicken.z,
+            fallback_position=chicken_spawn_position,
+            player_radius=0.75,
+            footprint=0.42,
+        )
+    if not moved:
+        moved, _ = move_entity_with_grounding(
+            chicken,
+            chicken.x,
+            chicken.z + (direction.z * step_distance),
+            fallback_position=chicken_spawn_position,
+            player_radius=0.75,
+            footprint=0.42,
+        )
+    if not moved:
+        chicken_walk_target[0] = get_new_chicken_walk_target()
+        update_chicken_animation(0.0)
+        return
 
     if direction.length() > 0:
         chicken.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
@@ -1398,17 +1587,21 @@ def inventory_pixel_to_local(x_px, y_px, z=-0.02):
 
 
 def inventory_pixel_scale(width_px, height_px):
-    return (width_px / INVENTORY_TEXTURE_WIDTH, height_px / INVENTORY_TEXTURE_HEIGHT)
+    return Vec3(width_px / INVENTORY_TEXTURE_WIDTH, height_px / INVENTORY_TEXTURE_HEIGHT, 1.0)
+
+
+def inventory_slot_icon_scale():
+    return Vec3(16 / 18, 16 / 18, 1.0)
 
 
 def get_inventory_grid_slot_position(slot_index):
     col = slot_index % INVENTORY_COLUMNS
     row = slot_index // INVENTORY_COLUMNS
-    return inventory_pixel_to_local(17 + (col * 18), 93 + (row * 18))
+    return inventory_pixel_to_local(16.5 + (col * 18), 92.5 + (row * 18))
 
 
 def get_inventory_hotbar_slot_position(slot_index):
-    return inventory_pixel_to_local(17 + (slot_index * 18), 151)
+    return inventory_pixel_to_local(16.5 + (slot_index * 18), 150.5)
 
 
 def refresh_inventory_hotbar_preview():
@@ -1477,7 +1670,7 @@ def create_inventory_player_preview():
         model="quad",
         texture=resolve_existing_asset_path([f"{UI_PATH}/player_preview.png"]) or "white_cube",
         color=color.white,
-        position=inventory_pixel_to_local(49, 41, -0.02),
+        position=inventory_pixel_to_local(48.5, 40.5, -0.02),
         scale=inventory_pixel_scale(32, 64),
     )
 
@@ -1592,7 +1785,7 @@ def create_inventory_ui():
                 model="quad",
                 texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[slot_idx]]),
                 position=(0, 0, -0.02),
-                scale=(0.9, 0.9),
+                scale=inventory_slot_icon_scale(),
                 color=color.white,
             )
         )
@@ -1616,7 +1809,7 @@ def create_inventory_ui():
                 model="quad",
                 texture="white_cube",
                 position=(0, 0, -0.02),
-                scale=(0.9, 0.9),
+                scale=inventory_slot_icon_scale(),
                 color=color.white,
             )
         )
@@ -1627,9 +1820,10 @@ def create_inventory_ui():
         parent=camera.ui,
         model="quad",
         texture="white_cube",
-        scale=(
-            INVENTORY_CARD_SCALE_X * (18 / INVENTORY_TEXTURE_WIDTH) * 0.9,
-            INVENTORY_CARD_SCALE_Y * (18 / INVENTORY_TEXTURE_HEIGHT) * 0.9,
+        scale=Vec3(
+            INVENTORY_CARD_SCALE_X * (16 / INVENTORY_TEXTURE_WIDTH),
+            INVENTORY_CARD_SCALE_Y * (16 / INVENTORY_TEXTURE_HEIGHT),
+            1.0,
         ),
         color=color.white,
         z=-0.35,
