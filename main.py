@@ -43,6 +43,11 @@ UI_PATH = Path("ui").as_posix()
 SKY_PATH = Path("skybox/generated").as_posix()
 DAMAGE_SOUND_PATH = Path("sounds/damage.wav").as_posix()
 WALK_SOUND_PATH = Path("sounds/walk-sound.wav").as_posix()
+MENU_CLICK_SOUND_PATH = Path("sounds/Click_stereo.ogg.mp3").as_posix()
+BGM_CANDIDATES = [
+    Path("sounds/Below_and_Above.ogg").as_posix(),
+    Path("sounds/Fireflies.ogg").as_posix(),
+]
 GROUND_Y = 0
 RENDER_RADIUS = 28
 RENDER_HEIGHT = 12
@@ -145,6 +150,11 @@ def apply_texture_recursively(entity, texture_obj):
 
 def get_existing_sound_files(candidates):
     return [sound_file for sound_file in candidates if resolve_asset_path(sound_file).exists()]
+
+
+def play_menu_click_sound():
+    if resolve_asset_path(MENU_CLICK_SOUND_PATH).exists():
+        Audio(MENU_CLICK_SOUND_PATH, autoplay=True, volume=0.35)
 
 
 def get_entity_model_min_y(entity):
@@ -1002,16 +1012,23 @@ sun_glow = Entity(
 )
 
 player = FirstPersonController()
+if hasattr(player, "cursor") and player.cursor is not None:
+    player.cursor.enabled = False
 player.base_speed = getattr(player, "speed", 5)
 spawn_point = Vec3(player.x, player.y, player.z)
 set_global_light_level(1.0)
 sync_active_blocks(force=True)
 
 menu = None
+crosshair = None
+background_music = None
 
 
 def on_menu_toggle(state):
-    pass
+    if crosshair is not None:
+        crosshair.enabled = not state
+    if state:
+        play_menu_click_sound()
 
 
 def is_game_paused():
@@ -1019,6 +1036,24 @@ def is_game_paused():
 
 
 menu = GameMenu(player, on_menu_toggle, toggle_fullscreen)
+
+crosshair = Entity(
+    parent=camera.ui,
+    model="quad",
+    texture=resolve_existing_asset_path([f"{UI_PATH}/Crosshair.png"]) or "white_cube",
+    position=(0, 0),
+    scale=(0.022, 0.022),
+    z=-0.5,
+)
+
+available_bgm_files = get_existing_sound_files(BGM_CANDIDATES)
+if available_bgm_files:
+    background_music = Audio(
+        random.choice(available_bgm_files),
+        autoplay=True,
+        loop=True,
+        volume=0.25,
+    )
 
 hotbar_bg = Entity(
     parent=camera.ui,

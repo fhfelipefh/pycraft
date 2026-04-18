@@ -30,3 +30,16 @@ def test_mobs_are_paused_when_menu_is_open():
     assert "if not is_game_paused():" in text
     assert "update_ambient_mobs()" in text
     assert "update_chicken_walking()" in text
+
+
+def test_custom_crosshair_is_integrated():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/Crosshair.png"])' in text
+    assert "crosshair.enabled = not state" in text
+
+
+def test_background_music_candidates_are_configured():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert "BGM_CANDIDATES" in text
+    assert '"sounds/Below_and_Above.ogg"' in text
+    assert '"sounds/Fireflies.ogg"' in text
