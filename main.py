@@ -1233,7 +1233,12 @@ inventory_hotbar_icons = []
 inventory_drag_icon = [None]
 inventory_drag_origin = [None]
 inventory_drag_block_index = [None]
+inventory_player_preview = [None]
 
+INVENTORY_TEXTURE_WIDTH = 176
+INVENTORY_TEXTURE_HEIGHT = 166
+INVENTORY_CARD_SCALE_X = 0.94
+INVENTORY_CARD_SCALE_Y = INVENTORY_CARD_SCALE_X * (INVENTORY_TEXTURE_HEIGHT / INVENTORY_TEXTURE_WIDTH)
 INVENTORY_COLUMNS = 9
 INVENTORY_ROWS = 3
 INVENTORY_PAGE_SIZE = INVENTORY_COLUMNS * INVENTORY_ROWS
@@ -1389,7 +1394,11 @@ def assign_inventory_block_to_selected_slot(block_index):
 
 
 def inventory_pixel_to_local(x_px, y_px, z=-0.02):
-    return Vec3((x_px / 256) - 0.5, 0.5 - (y_px / 256), z)
+    return Vec3((x_px / INVENTORY_TEXTURE_WIDTH) - 0.5, 0.5 - (y_px / INVENTORY_TEXTURE_HEIGHT), z)
+
+
+def inventory_pixel_scale(width_px, height_px):
+    return (width_px / INVENTORY_TEXTURE_WIDTH, height_px / INVENTORY_TEXTURE_HEIGHT)
 
 
 def get_inventory_grid_slot_position(slot_index):
@@ -1451,6 +1460,28 @@ def clear_inventory_drag():
         inventory_drag_icon[0].enabled = False
 
 
+def set_game_hud_visible(visible):
+    hotbar_bg.enabled = visible
+    hotbar_selector.enabled = visible
+    for icon in hotbar_icons:
+        icon.enabled = visible
+    for icon in hud_heart_icons:
+        icon.enabled = visible
+    for icon in hud_armor_icons:
+        icon.enabled = visible
+
+
+def create_inventory_player_preview():
+    inventory_player_preview[0] = Entity(
+        parent=inventory_card[0],
+        model="quad",
+        texture=resolve_existing_asset_path([f"{UI_PATH}/player_preview.png"]) or "white_cube",
+        color=color.white,
+        position=inventory_pixel_to_local(49, 41, -0.02),
+        scale=inventory_pixel_scale(32, 64),
+    )
+
+
 def start_inventory_drag():
     slot_kind, slot_index = get_inventory_hovered_slot()
     if slot_kind is None:
@@ -1509,7 +1540,7 @@ def create_inventory_ui():
     inventory_backdrop[0] = Entity(
         parent=camera.ui,
         model="quad",
-        color=color.rgba(0, 0, 0, 150),
+        color=color.rgba(0, 0, 0, 0),
         scale=(2.0, 2.0),
         z=0.45,
         enabled=False,
@@ -1528,7 +1559,7 @@ def create_inventory_ui():
         model="quad",
         texture=resolve_existing_asset_path([f"{UI_PATH}/inventory.png"]) or "white_cube",
         color=color.white,
-        scale=(0.72, 0.72),
+        scale=(INVENTORY_CARD_SCALE_X, INVENTORY_CARD_SCALE_Y),
         z=0,
     )
 
@@ -1537,7 +1568,7 @@ def create_inventory_ui():
         model="quad",
         texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"]) or "white_cube",
         color=color.white,
-        scale=(24 / 256, 24 / 256),
+        scale=inventory_pixel_scale(24, 24),
         position=get_inventory_hotbar_slot_position(selected_block_index),
         z=-0.03,
     )
@@ -1548,7 +1579,7 @@ def create_inventory_ui():
             model="quad",
             texture="white_cube",
             color=color.rgba(255, 255, 255, 1),
-            scale=(18 / 256, 18 / 256),
+            scale=inventory_pixel_scale(18, 18),
             position=get_inventory_hotbar_slot_position(slot_idx),
             text="",
             highlight_color=color.rgba(255, 255, 255, 18),
@@ -1561,7 +1592,7 @@ def create_inventory_ui():
                 model="quad",
                 texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[slot_idx]]),
                 position=(0, 0, -0.02),
-                scale=16 / 18,
+                scale=(0.9, 0.9),
                 color=color.white,
             )
         )
@@ -1572,7 +1603,7 @@ def create_inventory_ui():
             model="quad",
             texture="white_cube",
             color=color.rgba(255, 255, 255, 1),
-            scale=(18 / 256, 18 / 256),
+            scale=inventory_pixel_scale(18, 18),
             position=get_inventory_grid_slot_position(slot_idx),
             text="",
             highlight_color=color.rgba(255, 255, 255, 18),
@@ -1585,17 +1616,21 @@ def create_inventory_ui():
                 model="quad",
                 texture="white_cube",
                 position=(0, 0, -0.02),
-                scale=16 / 18,
+                scale=(0.9, 0.9),
                 color=color.white,
             )
         )
 
-    drag_scale = inventory_card[0].scale_x * (16 / 256)
+    create_inventory_player_preview()
+
     inventory_drag_icon[0] = Entity(
         parent=camera.ui,
         model="quad",
         texture="white_cube",
-        scale=(drag_scale, drag_scale),
+        scale=(
+            INVENTORY_CARD_SCALE_X * (18 / INVENTORY_TEXTURE_WIDTH) * 0.9,
+            INVENTORY_CARD_SCALE_Y * (18 / INVENTORY_TEXTURE_HEIGHT) * 0.9,
+        ),
         color=color.white,
         z=-0.35,
         enabled=False,
@@ -1615,12 +1650,14 @@ def set_inventory_open(state):
     if inventory_open[0]:
         player.enabled = False
         mouse.locked = False
+        set_game_hud_visible(False)
         if crosshair is not None:
             crosshair.enabled = False
     else:
         should_enable_player = not is_game_paused()
         player.enabled = should_enable_player
         mouse.locked = should_enable_player
+        set_game_hud_visible(True)
         if crosshair is not None:
             crosshair.enabled = should_enable_player
         clear_inventory_drag()

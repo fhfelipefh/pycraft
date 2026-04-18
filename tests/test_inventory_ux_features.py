@@ -26,3 +26,9 @@ def test_inventory_supports_drag_and_drop_to_hotbar():
     assert "def finish_inventory_drag():" in text
     assert 'if key == "left mouse down":' in text
     assert 'if key == "left mouse up":' in text
+
+
+def test_inventory_uses_player_preview_sprite_and_larger_slot_icons():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/player_preview.png"])' in text
+    assert "scale=(0.9, 0.9)" in text
