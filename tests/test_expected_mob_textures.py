@@ -3,18 +3,15 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 EXPECTED = {
-    "minecraft-bat": ["bat.png"],
     "minecraft-chicken": ["chicken.png"],
     "minecraft-cow": ["cow.png"],
     "minecraft-ender-dragon": ["ender_dragon.png"],
     "minecraft-iron-golem": ["iron_golem.png"],
     "minecraft-sheep": ["sheep.png", "sheep_fur.png"],
-    "minecraft-slime": ["slime.png"],
     "minecraft-snow-golem": [],  # sem assets no repo? manter flexível
     "minecraft-spider": ["spider.png"],
     "minecraft-villager": ["villager_farmer.png"],
     "minecraft-wither": ["wither.png"],
-    "minecraft-zombie": ["zombie.png"],
 }
 
 

@@ -23,11 +23,12 @@ from ursina import (
 )
 from ursina.shaders import unlit_shader
 from mob_textures import apply_texture_recursively
+from mob_grounding import get_support_top_y, compute_lift_delta, compute_grounded_entity_y
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from menu import GameMenu
 
-app = Ursina(development_mode=False, editor_ui_enabled=False, fullscreen=False, borderless=False)
+app = Ursina(development_mode=False, editor_ui_enabled=False, fullscreen=False, borderless=False, title="pycraft")
 BASE_DIR = Path(__file__).resolve().parent
 application.asset_folder = BASE_DIR
 window.fullscreen = False
@@ -43,9 +44,9 @@ SKY_PATH = Path("skybox/generated").as_posix()
 DAMAGE_SOUND_PATH = Path("sounds/damage.wav").as_posix()
 WALK_SOUND_PATH = Path("sounds/walk-sound.wav").as_posix()
 GROUND_Y = 0
-RENDER_RADIUS = 16
+RENDER_RADIUS = 28
 RENDER_HEIGHT = 12
-CUSTOM_RENDER_RADIUS = 48
+CUSTOM_RENDER_RADIUS = 84
 CUSTOM_RENDER_HEIGHT = 24
 PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
@@ -111,7 +112,7 @@ def _compose_rgba_if_opacity_exists(diffuse_path: str) -> str:
         return diffuse_path
 
 
-def load_texture_or_fallback(path_like):
+def load_texture_or_fallback(path_like, use_opacity_map=True):
     """Load a texture and fall back to a default when missing.
 
     Explicitly loading and then forcing the texture on FBX submeshes avoids
@@ -119,7 +120,7 @@ def load_texture_or_fallback(path_like):
     drivers/versões.
     """
     # Compose RGBA with *_opacity.png when disponível
-    candidate = _compose_rgba_if_opacity_exists(path_like)
+    candidate = _compose_rgba_if_opacity_exists(path_like) if use_opacity_map else path_like
     resolved = resolve_existing_asset_or_fallback([candidate])
     try:
         tex = load_texture(resolved)
@@ -144,6 +145,49 @@ def apply_texture_recursively(entity, texture_obj):
 
 def get_existing_sound_files(candidates):
     return [sound_file for sound_file in candidates if resolve_asset_path(sound_file).exists()]
+
+
+def get_entity_model_min_y(entity):
+    try:
+        tight_bounds = entity.model.get_tight_bounds()
+        if tight_bounds:
+            min_point, _ = tight_bounds
+            return float(min_point.y)
+    except Exception:
+        pass
+    return -0.5
+
+
+def get_support_top_y_under_entity(entity, probe_height=6.0, probe_distance=24.0):
+    hit = raycast(
+        Vec3(entity.x, entity.y + probe_height, entity.z),
+        Vec3(0, -1, 0),
+        distance=probe_distance,
+        ignore=(entity,),
+    )
+    if hit.hit and hasattr(hit.entity, "block_type"):
+        return float(hit.world_point.y)
+    return None
+
+
+def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
+    support_top = get_support_top_y_under_entity(entity)
+    if support_top is None:
+        block_positions = tuple(active_blocks.keys())
+        support_top = get_support_top_y(block_positions, entity.x, entity.z, footprint=footprint)
+    if support_top is None:
+        return False
+
+    model_min_y = get_entity_model_min_y(entity)
+    scale_y = getattr(entity, "scale_y", 1.0) or 1.0
+    grounded_y = compute_grounded_entity_y(model_min_y, scale_y, support_top, epsilon=epsilon)
+    if grounded_y is None:
+        return False
+
+    if abs(entity.y - grounded_y) > 1e-4:
+        entity.y = grounded_y
+        return True
+    return False
 
 BLOCK_TYPES = [
     {
@@ -727,10 +771,10 @@ def get_new_chicken_walk_target():
     )
 
 
-def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False):
+def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False, use_opacity_map=True):
     spawn_position = Vec3(position.x, position.y + ground_offset, position.z)
     model_resolved = resolve_existing_asset_or_fallback([model_path])
-    tex_obj = load_texture_or_fallback(texture_path)
+    tex_obj = load_texture_or_fallback(texture_path, use_opacity_map=use_opacity_map)
     mob = Entity(
         parent=scene,
         model=model_resolved,
@@ -744,10 +788,16 @@ def create_ambient_mob(name, model_path, texture_path, position, scale, walk_spe
     apply_texture_recursively(mob, tex_obj)
     mob.setTwoSided(True)
     mob.collider = "box"
+    grounded_y = mob.y
+    if not floating:
+        # Garante que o mob não nasça enterrado no terreno/blocos.
+        if lift_entity_out_of_blocks(mob):
+            grounded_y = mob.y
     return {
         "name": name,
         "entity": mob,
-        "spawn": Vec3(mob.x, mob.y, mob.z),
+        "spawn": Vec3(mob.x, grounded_y, mob.z),
+        "grounded_y": grounded_y,
         "target": [None],
         "walk_speed": walk_speed,
         "walk_radius": walk_radius,
@@ -769,6 +819,7 @@ def get_new_mob_walk_target(mob_state):
 def update_generic_mob_walk(mob_state):
     mob = mob_state["entity"]
     target = mob_state["target"][0]
+    ground_y = mob_state.get("grounded_y", mob_state["spawn"].y)
 
     if target is None:
         mob_state["target"][0] = get_new_mob_walk_target(mob_state)
@@ -785,13 +836,13 @@ def update_generic_mob_walk(mob_state):
     step_distance = mob_state["walk_speed"] * time.dt
     next_position = Vec3(
         mob.x + (direction.x * step_distance),
-        mob_state["spawn"].y,
+        ground_y,
         mob.z + (direction.z * step_distance),
     )
 
     if mob_position_is_blocked(next_position, player_radius=mob_state["player_radius"]):
-        x_only_position = Vec3(next_position.x, mob_state["spawn"].y, mob.z)
-        z_only_position = Vec3(mob.x, mob_state["spawn"].y, next_position.z)
+        x_only_position = Vec3(next_position.x, ground_y, mob.z)
+        z_only_position = Vec3(mob.x, ground_y, next_position.z)
 
         if not mob_position_is_blocked(x_only_position, player_radius=mob_state["player_radius"]):
             mob.x = x_only_position.x
@@ -808,22 +859,18 @@ def update_generic_mob_walk(mob_state):
 
     mob_state["animation_time"][0] += time.dt * (2.2 + (step_distance * 5.0))
     mob.rotation_z = math.sin(mob_state["animation_time"][0] * 0.45) * 1.2
-
-
-def update_bat_mob(mob_state):
-    mob = mob_state["entity"]
-    mob_state["animation_time"][0] += time.dt * 4.5
-    mob.y = mob_state["spawn"][1] + math.sin(mob_state["animation_time"][0]) * 0.18
-    mob.rotation_z = math.sin(mob_state["animation_time"][0] * 1.8) * 10
-    mob.rotation_y = (mob.rotation_y + (time.dt * 28.0)) % 360
+    if lift_entity_out_of_blocks(mob):
+        mob_state["grounded_y"] = mob.y
+        mob_state["spawn"] = Vec3(mob_state["spawn"].x, mob.y, mob_state["spawn"].z)
 
 
 def update_ambient_mobs():
     for mob_state in ambient_mob_states.values():
-        if mob_state["name"] == "bat":
-            update_bat_mob(mob_state)
-        else:
-            update_generic_mob_walk(mob_state)
+        mob = mob_state["entity"]
+        if lift_entity_out_of_blocks(mob):
+            mob_state["grounded_y"] = mob.y
+            mob_state["spawn"] = Vec3(mob_state["spawn"].x, mob.y, mob_state["spawn"].z)
+        update_generic_mob_walk(mob_state)
 
 
 ambient_mobs = [
@@ -860,21 +907,8 @@ ambient_mobs = [
         0.68,
         6.5,
         rotation_y=180,
-        ground_offset=0.05,
-        player_radius=0.8,
-    ),
-    create_ambient_mob(
-        "zombie",
-        "mobs/minecraft-zombie/source/zombie.fbx",
-        "mobs/minecraft-zombie/textures/zombie.png",
-        Vec3(-12, 0.53, -8),
-        0.075,
-        0.74,
-        7.5,
-        rotation_y=180,
-        tint=color.rgb(220, 235, 220),
         ground_offset=0.0,
-        player_radius=0.85,
+        player_radius=0.8,
     ),
     create_ambient_mob(
         "iron_golem",
@@ -889,19 +923,6 @@ ambient_mobs = [
         player_radius=1.2,
     ),
     create_ambient_mob(
-        "slime",
-        "mobs/minecraft-slime/source/slime.fbx",
-        "mobs/minecraft-slime/textures/slime.png",
-        Vec3(2, 0.53, -14),
-        0.085,
-        0.58,
-        4.5,
-        rotation_y=180,
-        tint=color.rgba(255, 255, 255, 210),
-        ground_offset=-0.08,
-        player_radius=0.7,
-    ),
-    create_ambient_mob(
         "spider",
         "mobs/minecraft-spider/source/spider.fbx",
         "mobs/minecraft-spider/textures/spider.png",
@@ -912,20 +933,6 @@ ambient_mobs = [
         rotation_y=180,
         ground_offset=-0.03,
         player_radius=0.85,
-    ),
-    create_ambient_mob(
-        "bat",
-        "mobs/minecraft-bat/source/bat.fbx",
-        "mobs/minecraft-bat/textures/bat.png",
-        Vec3(6, 3.2, -8),
-        0.06,
-        0.0,
-        0.0,
-        rotation_y=180,
-        tint=color.rgba(255, 255, 255, 220),
-        ground_offset=2.2,
-        floating=True,
-        player_radius=0.5,
     ),
 ]
 
@@ -974,6 +981,7 @@ def update_chicken_walking():
         chicken.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
 
     update_chicken_animation(step_distance)
+    lift_entity_out_of_blocks(chicken)
 
 sun_visual = Entity(
     parent=scene,
