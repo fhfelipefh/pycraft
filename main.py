@@ -9,6 +9,7 @@ from ursina import (
     Audio,
     Button,
     Entity,
+    Mesh,
     Sky,
     Text,
     Ursina,
@@ -28,8 +29,19 @@ from ursina import (
 )
 from ursina.shaders import unlit_shader
 from mob_textures import apply_texture_recursively
-from mob_grounding import get_support_top_y, compute_lift_delta, compute_grounded_entity_y
-from voxel_accel import get_filtered_custom_positions, get_flat_ground_positions
+from mob_grounding import compute_grounded_entity_y
+from voxel_accel import get_filtered_custom_positions
+from voxel_chunk import (
+    BlockHit,
+    CHUNK_SIZE,
+    build_chunk_mesh,
+    build_texture_atlas,
+    chunk_key_from_block,
+    chunk_key_from_world,
+    get_top_block_in_column,
+    iter_chunk_block_positions,
+    reverse_triangle_winding,
+)
 from terrain_async_scheduler import DesiredPositionsScheduler
 from ursina.prefabs.first_person_controller import FirstPersonController
 
@@ -65,6 +77,9 @@ PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
 CLOUD_CYCLE_SECONDS = 9 * 60
 BLOCK_INTERACTION_RANGE = 20
+GROUND_RENDER_CHUNK_RADIUS = max(1, math.ceil(RENDER_RADIUS / CHUNK_SIZE))
+CUSTOM_RENDER_CHUNK_RADIUS = max(1, math.ceil(CUSTOM_RENDER_RADIUS / CHUNK_SIZE))
+CUSTOM_RENDER_CHUNK_HEIGHT = max(1, math.ceil(CUSTOM_RENDER_HEIGHT / CHUNK_SIZE))
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
@@ -206,23 +221,44 @@ def get_entity_model_max_y(entity):
     return 0.5
 
 
+def get_top_solid_block_at_position(x, z, probe_from_y, footprint=0.5):
+    del footprint
+    return get_top_block_in_column(
+        x=x,
+        z=z,
+        probe_from_y=probe_from_y,
+        get_block_type_at=get_block_type_at,
+        ground_y=GROUND_Y,
+    )
+
+
 def get_support_top_y_under_entity(entity, probe_height=6.0, probe_distance=24.0):
+    ignore = [entity]
+    if highlighted_box[0] is not None:
+        ignore.append(highlighted_box[0])
+
     hit = raycast(
         Vec3(entity.x, entity.y + probe_height, entity.z),
         Vec3(0, -1, 0),
         distance=probe_distance,
-        ignore=(entity,),
+        ignore=tuple(ignore),
     )
-    if hit.hit and hasattr(hit.entity, "block_type"):
+    if hit.hit and hasattr(hit.entity, "chunk_key"):
         return float(hit.world_point.y)
-    return None
+
+    support_position = get_top_solid_block_at_position(
+        entity.x,
+        entity.z,
+        entity.y + probe_height,
+        footprint=0.5,
+    )
+    if support_position is None:
+        return None
+    return float(support_position[1])
 
 
 def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
     support_top = get_support_top_y_under_entity(entity)
-    if support_top is None:
-        block_positions = tuple(active_blocks.keys())
-        support_top = get_support_top_y(block_positions, entity.x, entity.z, footprint=footprint)
     if support_top is None:
         return False
 
@@ -239,35 +275,25 @@ def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
 
 
 def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footprint=0.5):
-    ignore = (ignore_entity,) if ignore_entity is not None else ()
+    ignore = []
+    if ignore_entity is not None:
+        ignore.append(ignore_entity)
+    if highlighted_box[0] is not None:
+        ignore.append(highlighted_box[0])
+
     hit = raycast(
         Vec3(x, probe_from_y, z),
         Vec3(0, -1, 0),
         distance=max(4.0, probe_from_y - (GROUND_Y - 8.0)),
-        ignore=ignore,
+        ignore=tuple(ignore),
     )
-    if hit.hit and hasattr(hit.entity, "block_type"):
+    if hit.hit and hasattr(hit.entity, "chunk_key"):
         return float(hit.world_point.y)
 
-    top = None
-    min_x = math.floor(x - footprint)
-    max_x = math.ceil(x + footprint)
-    min_z = math.floor(z - footprint)
-    max_z = math.ceil(z + footprint)
-    max_y = math.ceil(probe_from_y)
-
-    for bx in range(min_x, max_x + 1):
-        for bz in range(min_z, max_z + 1):
-            if abs(bx - x) > footprint or abs(bz - z) > footprint:
-                continue
-            for by in range(GROUND_Y, max_y + 1):
-                if get_block_type_at((bx, by, bz)) is None:
-                    continue
-                candidate_top = by + 1.0
-                if top is None or candidate_top > top:
-                    top = candidate_top
-
-    return top
+    support_position = get_top_solid_block_at_position(x, z, probe_from_y, footprint=footprint)
+    if support_position is None:
+        return None
+    return float(support_position[1])
 
 
 def get_grounded_y_for_entity_at(entity, x, z, probe_from_y=None, footprint=0.5, epsilon=0.01):
@@ -365,6 +391,13 @@ for block_type in BLOCK_TYPES:
     )
     block_type["block_texture_path"] = block_texture_path or "white_cube"
     block_type["icon_texture_path"] = icon_texture_path or block_type["block_texture_path"]
+
+BLOCK_ATLAS = build_texture_atlas(
+    [block_type["block_texture_path"] for block_type in BLOCK_TYPES],
+    BASE_DIR,
+)
+BLOCK_ATLAS_TEXTURE = load_texture(BLOCK_ATLAS.texture_path)
+BLOCK_ATLAS_TEXTURE.filtering = False
 
 hotbar_block_indices = list(range(min(HOTBAR_SLOT_COUNT, len(BLOCK_TYPES))))
 while len(hotbar_block_indices) < HOTBAR_SLOT_COUNT:
@@ -484,6 +517,8 @@ step_cooldown = [0.0]
 was_grounded = [True]
 last_support_block = [None]
 last_render_cell = [None]
+last_render_chunk = [None]
+last_desired_chunks = [set()]
 sun_elapsed_time = [0.0]
 light_update_timer = [0.0]
 current_light_level = [255]
@@ -491,9 +526,12 @@ fps_overlay_visible = [False]
 fps_timer = [0.0]
 fps_frames = [0]
 
-active_blocks = {}
+active_chunks = {}
 custom_blocks = {}
+custom_blocks_by_chunk = {}
 removed_blocks = set()
+dirty_chunks = set()
+chunk_visibility_dirty = [True]
 
 desired_positions_executor = ThreadPoolExecutor(max_workers=2)
 desired_positions_scheduler = [None]
@@ -563,6 +601,18 @@ def get_render_cell(position):
     )
 
 
+def get_render_chunk(position):
+    return chunk_key_from_world(position)
+
+
+def world_point_to_block_position(point):
+    return (
+        math.floor(point.x + 0.5),
+        math.ceil(point.y),
+        math.floor(point.z + 0.5),
+    )
+
+
 def play_sound_group(group_name, event_name):
     group = SOUND_GROUPS.get(group_name, {})
     sound_data = group.get(event_name)
@@ -595,19 +645,16 @@ def play_material_sound(block_type, event_name):
         play_sound_group("default", event_name)
 
 
-def can_interact_with_block(block_entity):
-    if block_entity is None:
+def can_interact_with_block(block_hit):
+    if block_hit is None:
         return False
 
-    try:
-        block_position = block_entity.position
-    except AssertionError:
-        return False
-
-    if block_position is None:
-        return False
-
-    return (player.position - block_position).length() <= BLOCK_INTERACTION_RANGE
+    block_center = Vec3(
+        block_hit.position[0],
+        block_hit.position[1] - 0.5,
+        block_hit.position[2],
+    )
+    return (player.position - block_center).length() <= BLOCK_INTERACTION_RANGE
 
 
 def get_block_type_at(position):
@@ -620,53 +667,160 @@ def get_block_type_at(position):
     return None
 
 
-def create_block_entity(position, block_type):
-    block = Entity(
+def get_block_texture_key(block_type):
+    return block_type["block_texture_path"]
+
+
+def register_custom_block(position, block_type):
+    custom_blocks[position] = block_type
+    custom_blocks_by_chunk.setdefault(chunk_key_from_block(position), set()).add(position)
+
+
+def unregister_custom_block(position):
+    custom_blocks.pop(position, None)
+    chunk_key = chunk_key_from_block(position)
+    chunk_positions = custom_blocks_by_chunk.get(chunk_key)
+    if not chunk_positions:
+        return
+    chunk_positions.discard(position)
+    if not chunk_positions:
+        custom_blocks_by_chunk.pop(chunk_key, None)
+
+
+def get_chunk_positions_for_mesh(chunk_key):
+    return tuple(
+        iter_chunk_block_positions(
+            chunk_key,
+            GROUND_Y,
+            GROUND_BLOCK_TYPE,
+            custom_blocks_by_chunk.get(chunk_key, ()),
+            custom_blocks,
+            removed_blocks,
+        )
+    )
+
+
+def mark_chunk_dirty(chunk_key):
+    dirty_chunks.add(chunk_key)
+
+
+def mark_dirty_chunks_for_position(position):
+    chunk_key = chunk_key_from_block(position)
+    cx, cy, cz = chunk_key
+    for delta_x, delta_y, delta_z in (
+        (0, 0, 0),
+        (-1, 0, 0),
+        (1, 0, 0),
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+    ):
+        mark_chunk_dirty((cx + delta_x, cy + delta_y, cz + delta_z))
+
+
+def create_chunk_entity(chunk_key):
+    origin_x = chunk_key[0] * CHUNK_SIZE
+    origin_y = chunk_key[1] * CHUNK_SIZE
+    origin_z = chunk_key[2] * CHUNK_SIZE
+    chunk_entity = Entity(
         parent=scene,
-        model="cube",
-        position=position,
-        texture=get_block_texture(block_type),
-        origin_y=0.5,
-        collider="box",
+        position=Vec3(origin_x, origin_y, origin_z),
+        texture=BLOCK_ATLAS_TEXTURE,
         shader=unlit_shader,
         color=color.white,
+        enabled=False,
     )
-    block.block_type = block_type
-    block.grid_position = position
-    apply_lighting_to_entity(block)
-    active_blocks[position] = block
-    return block
+    chunk_entity.chunk_key = chunk_key
+    active_chunks[chunk_key] = chunk_entity
+    rebuild_chunk_entity(chunk_key)
+    return chunk_entity
 
 
-def remove_block_entity(position):
-    block = active_blocks.pop(position, None)
-    if block is not None:
-        destroy(block)
+def rebuild_chunk_entity(chunk_key):
+    chunk_entity = active_chunks.get(chunk_key)
+    if chunk_entity is None:
+        return
+
+    mesh_data = build_chunk_mesh(
+        chunk_key,
+        get_chunk_positions_for_mesh(chunk_key),
+        get_block_type_at,
+        get_block_texture_key,
+        BLOCK_ATLAS.tiles,
+    )
+
+    if mesh_data.is_empty:
+        chunk_entity.enabled = False
+        chunk_entity.collider = None
+        chunk_entity.model = None
+        dirty_chunks.discard(chunk_key)
+        return
+
+    render_triangles = reverse_triangle_winding(mesh_data.triangles)
+
+    chunk_entity.collider = None
+    chunk_entity.model = Mesh(
+        vertices=mesh_data.vertices,
+        triangles=render_triangles,
+        uvs=mesh_data.uvs,
+        mode="triangle",
+        static=True,
+    )
+    chunk_entity.texture = BLOCK_ATLAS_TEXTURE
+    chunk_entity.collider = Mesh(
+        vertices=mesh_data.vertices,
+        triangles=render_triangles,
+        mode="triangle",
+        static=True,
+    )
+    chunk_entity.enabled = True
+    apply_lighting_to_entity(chunk_entity)
+    dirty_chunks.discard(chunk_key)
+
+
+def remove_chunk_entity(chunk_key):
+    chunk_entity = active_chunks.pop(chunk_key, None)
+    if chunk_entity is not None:
+        destroy(chunk_entity)
+    dirty_chunks.discard(chunk_key)
 
 
 def set_block_at(position, block_type):
     removed_blocks.discard(position)
 
     if position[1] == GROUND_Y and block_type == GROUND_BLOCK_TYPE:
-        custom_blocks.pop(position, None)
+        unregister_custom_block(position)
     else:
-        custom_blocks[position] = block_type
+        register_custom_block(position, block_type)
 
-    active_block = active_blocks.get(position)
-    if active_block is None:
-        if position in get_desired_positions(last_render_cell[0]):
-            create_block_entity(position, block_type)
-        return
-
-    active_block.texture = get_block_texture(block_type)
-    active_block.block_type = block_type
+    mark_dirty_chunks_for_position(position)
+    chunk_visibility_dirty[0] = True
 
 
 def remove_block_at(position):
-    custom_blocks.pop(position, None)
+    unregister_custom_block(position)
     if position[1] == GROUND_Y:
         removed_blocks.add(position)
-    remove_block_entity(position)
+    else:
+        removed_blocks.discard(position)
+
+    mark_dirty_chunks_for_position(position)
+    chunk_visibility_dirty[0] = True
+
+
+def get_priority_ground_chunks(position):
+    min_chunk_x = math.floor((position[0] - PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
+    max_chunk_x = math.floor((position[0] + PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
+    min_chunk_z = math.floor((position[2] - PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
+    max_chunk_z = math.floor((position[2] + PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
+    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
+
+    desired = set()
+    for chunk_x in range(min_chunk_x, max_chunk_x + 1):
+        for chunk_z in range(min_chunk_z, max_chunk_z + 1):
+            desired.add((chunk_x, ground_chunk_y, chunk_z))
+    return desired
 
 
 def get_desired_positions(render_cell):
@@ -675,9 +829,12 @@ def get_desired_positions(render_cell):
 
     px, py, pz = render_cell
     desired = set()
+    player_chunk = chunk_key_from_block(render_cell)
+    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
 
-    for position in get_flat_ground_positions(px, pz, RENDER_RADIUS, GROUND_Y):
-        desired.add(position)
+    for delta_x in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
+        for delta_z in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
+            desired.add((player_chunk[0] + delta_x, ground_chunk_y, player_chunk[2] + delta_z))
 
     filtered_custom_positions = get_filtered_custom_positions(
         custom_blocks.keys(),
@@ -689,46 +846,25 @@ def get_desired_positions(render_cell):
     )
 
     for position in filtered_custom_positions:
-        desired.add(position)
-
-        for dx in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-            for dz in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-                ground_position = (position[0] + dx, GROUND_Y, position[2] + dz)
-                if ground_position not in removed_blocks:
-                    desired.add(ground_position)
+        desired.add(chunk_key_from_block(position))
+        desired.update(get_priority_ground_chunks(position))
 
     return desired
 
 
-def should_keep_block_loaded(position, render_cell):
-    if render_cell is None:
-        return False
-
-    px, py, pz = render_cell
-    x, y, z = position
-
-    if y == GROUND_Y:
-        return (
-            abs(x - px) <= (RENDER_RADIUS + RENDER_UNLOAD_PADDING)
-            and abs(z - pz) <= (RENDER_RADIUS + RENDER_UNLOAD_PADDING)
-        )
-
-    return (
-        abs(x - px) <= (CUSTOM_RENDER_RADIUS + RENDER_UNLOAD_PADDING)
-        and abs(y - py) <= (CUSTOM_RENDER_HEIGHT + RENDER_UNLOAD_PADDING)
-        and abs(z - pz) <= (CUSTOM_RENDER_RADIUS + RENDER_UNLOAD_PADDING)
-    )
-
-
 def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_positions):
+    del removed_positions
     if render_cell is None:
         return set()
 
     px, py, pz = render_cell
     desired = set()
+    player_chunk = chunk_key_from_block(render_cell)
+    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
 
-    for position in get_flat_ground_positions(px, pz, RENDER_RADIUS, GROUND_Y):
-        desired.add(position)
+    for delta_x in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
+        for delta_z in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
+            desired.add((player_chunk[0] + delta_x, ground_chunk_y, player_chunk[2] + delta_z))
 
     filtered_custom_positions = get_filtered_custom_positions(
         custom_positions,
@@ -739,15 +875,9 @@ def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_
         CUSTOM_RENDER_HEIGHT,
     )
 
-    removed_positions = set(removed_positions)
     for position in filtered_custom_positions:
-        desired.add(position)
-
-        for dx in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-            for dz in range(-PRIORITY_GROUND_RADIUS, PRIORITY_GROUND_RADIUS + 1):
-                ground_position = (position[0] + dx, GROUND_Y, position[2] + dz)
-                if ground_position not in removed_positions:
-                    desired.add(ground_position)
+        desired.add(chunk_key_from_block(position))
+        desired.update(get_priority_ground_chunks(position))
 
     return desired
 
@@ -760,52 +890,93 @@ desired_positions_scheduler[0] = DesiredPositionsScheduler(
 
 def sync_active_blocks(force=False):
     render_cell = get_render_cell(player.position)
-    if not force and render_cell == last_render_cell[0]:
-        return
+    render_chunk = get_render_chunk(player.position)
+    desired_chunks = last_desired_chunks[0]
+    needs_visibility_refresh = force or chunk_visibility_dirty[0] or render_chunk != last_render_chunk[0]
 
-    if force:
-        desired_positions = get_desired_positions(render_cell)
-    else:
-        desired_positions_scheduler[0].request(
-            render_cell,
-            tuple(custom_blocks.keys()),
-            tuple(removed_blocks),
-        )
-        desired_positions = desired_positions_scheduler[0].consume(render_cell)
-        if desired_positions is None:
-            return
+    if needs_visibility_refresh:
+        if force:
+            desired_chunks = get_desired_positions(render_cell)
+        else:
+            desired_positions_scheduler[0].request(
+                render_cell,
+                tuple(custom_blocks.keys()),
+                tuple(removed_blocks),
+            )
+            desired_chunks = desired_positions_scheduler[0].consume(render_cell)
+            if desired_chunks is None:
+                for chunk_key in tuple(dirty_chunks):
+                    if chunk_key in active_chunks:
+                        rebuild_chunk_entity(chunk_key)
+                return
 
-    current_positions = set(active_blocks)
+        current_chunks = set(active_chunks)
+        for chunk_key in current_chunks - desired_chunks:
+            remove_chunk_entity(chunk_key)
 
-    for position in current_positions - desired_positions:
-        if should_keep_block_loaded(position, render_cell):
+        for chunk_key in desired_chunks - current_chunks:
+            create_chunk_entity(chunk_key)
+
+        last_render_chunk[0] = render_chunk
+        last_render_cell[0] = render_cell
+        last_desired_chunks[0] = desired_chunks
+        chunk_visibility_dirty[0] = False
+
+    for chunk_key in tuple(dirty_chunks):
+        if chunk_key not in last_desired_chunks[0]:
+            dirty_chunks.discard(chunk_key)
             continue
-        remove_block_entity(position)
-
-    for position in desired_positions - current_positions:
-        block_type = get_block_type_at(position)
-        if block_type is not None:
-            create_block_entity(position, block_type)
-
-    last_render_cell[0] = render_cell
+        if chunk_key not in active_chunks:
+            create_chunk_entity(chunk_key)
+            continue
+        rebuild_chunk_entity(chunk_key)
 
 
 def get_target_block():
-    hovered = mouse.hovered_entity
-    if hovered is not None and hasattr(hovered, "block_type"):
-        return hovered
-    return None
-
-
-def highlight_box(box):
-    if highlighted_box[0] is box:
-        return
+    ignore = [player]
     if highlighted_box[0] is not None:
-        apply_lighting_to_entity(highlighted_box[0])
-    if box is not None:
-        level = min(255, current_light_level[0] + 32)
-        box.color = color.rgba(level, level, level, 255)
-    highlighted_box[0] = box
+        ignore.append(highlighted_box[0])
+
+    hit = raycast(
+        camera.world_position,
+        camera.forward,
+        distance=BLOCK_INTERACTION_RANGE,
+        ignore=tuple(ignore),
+    )
+    if not hit.hit or not hasattr(hit.entity, "chunk_key"):
+        return None
+
+    block_position = world_point_to_block_position(hit.world_point - (hit.world_normal * 0.001))
+    block_type = get_block_type_at(block_position)
+    if block_type is None:
+        return None
+
+    return BlockHit(
+        position=block_position,
+        normal=(
+            int(round(hit.world_normal.x)),
+            int(round(hit.world_normal.y)),
+            int(round(hit.world_normal.z)),
+        ),
+        distance=hit.distance,
+        block_type=block_type,
+    )
+
+
+def highlight_box(block_hit):
+    if highlighted_box[0] is None:
+        return
+
+    if block_hit is None:
+        highlighted_box[0].enabled = False
+        return
+
+    highlighted_box[0].enabled = True
+    highlighted_box[0].position = Vec3(
+        block_hit.position[0],
+        block_hit.position[1],
+        block_hit.position[2],
+    )
 
 
 def update_highlight():
@@ -813,15 +984,21 @@ def update_highlight():
 
 
 def get_supporting_block():
+    ignore = [player]
+    if highlighted_box[0] is not None:
+        ignore.append(highlighted_box[0])
+
     hit = raycast(
         player.position + Vec3(0, 0.1, 0),
         Vec3(0, -1, 0),
         distance=2,
-        ignore=(player,),
+        ignore=tuple(ignore),
     )
-    if hit.hit and hasattr(hit.entity, "block_type"):
-        return hit.entity
-    return None
+    if not hit.hit or not hasattr(hit.entity, "chunk_key"):
+        return None
+
+    support_position = world_point_to_block_position(hit.world_point - (hit.world_normal * 0.001))
+    return get_block_type_at(support_position)
 
 
 def set_global_light_level(daylight):
@@ -833,8 +1010,8 @@ def apply_lighting_to_entity(entity):
 
 
 def refresh_active_block_lighting():
-    for block in active_blocks.values():
-        apply_lighting_to_entity(block)
+    for chunk_entity in active_chunks.values():
+        apply_lighting_to_entity(chunk_entity)
 
 
 sky_base_texture = resolve_existing_asset_or_fallback(
@@ -1011,8 +1188,8 @@ def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint
                 if get_block_type_at((bx, by, bz)) is None:
                     continue
 
-                block_bottom = float(by)
-                block_top = block_bottom + 1.0
+                block_top = float(by)
+                block_bottom = block_top - 1.0
                 if block_top <= body_bottom or block_bottom >= body_top:
                     continue
                 return True
@@ -1401,6 +1578,17 @@ player.base_speed = getattr(player, "speed", 5)
 spawn_point = Vec3(player.x, player.y, player.z)
 set_global_light_level(1.0)
 sync_active_blocks(force=True)
+highlighted_box[0] = Entity(
+    parent=scene,
+    model="wireframe_cube",
+    position=Vec3(0, -999, 0),
+    scale=1.005,
+    origin_y=0.5,
+    color=color.rgba(255, 255, 255, 180),
+    shader=unlit_shader,
+    collider=None,
+    enabled=False,
+)
 
 menu = None
 crosshair = None
@@ -1978,7 +2166,7 @@ def input(key):
     if key == "space":
         support_block = last_support_block[0]
         if player.enabled and player.grounded and support_block is not None:
-            play_material_sound(support_block.block_type, "jump")
+            play_material_sound(support_block, "jump")
         return
 
     target_block = get_target_block()
@@ -1989,7 +2177,11 @@ def input(key):
         return
 
     if key == "right mouse down":
-        new_position = to_grid_position(target_block.position + mouse.normal)
+        new_position = (
+            target_block.position[0] + target_block.normal[0],
+            target_block.position[1] + target_block.normal[1],
+            target_block.position[2] + target_block.normal[2],
+        )
         if get_block_type_at(new_position) is None:
             block_type = get_selected_block_type()
             set_block_at(new_position, block_type)
@@ -1999,7 +2191,7 @@ def input(key):
     if key == "left mouse down":
         play_material_sound(target_block.block_type, "hit")
         play_material_sound(target_block.block_type, "break")
-        remove_block_at(target_block.grid_position)
+        remove_block_at(target_block.position)
         highlight_box(None)
 
 
@@ -2132,13 +2324,13 @@ def update():
         moving = player.input_direction.magnitude() > 0.1
 
     if current_grounded and not was_grounded[0] and support_block is not None:
-        play_material_sound(support_block.block_type, "land")
+        play_material_sound(support_block, "land")
 
     if player.enabled and moving and current_grounded:
         step_cooldown[0] -= time.dt
         if step_cooldown[0] <= 0:
             if support_block is not None:
-                play_material_sound(support_block.block_type, "step")
+                play_material_sound(support_block, "step")
             else:
                 play_sound_group("default", "step")
             step_cooldown[0] = 0.32
