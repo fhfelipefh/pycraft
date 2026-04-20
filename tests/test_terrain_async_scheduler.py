@@ -1,4 +1,4 @@
-from terrain_async_scheduler import DesiredPositionsScheduler
+from pycraft.terrain_async_scheduler import DesiredPositionsScheduler
 
 
 class FakeFuture:

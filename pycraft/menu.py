@@ -1,10 +1,11 @@
 from pathlib import Path
 import sys
+from zipfile import ZipFile
 
 from ursina import Audio, Button, Entity, Text, camera, color, mouse
 
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def rgba255(r, g, b, a=255):
@@ -13,8 +14,28 @@ def rgba255(r, g, b, a=255):
 
 def resolve_menu_asset_path(candidates):
     for relative_path in candidates:
-        if (BASE_DIR / relative_path).exists():
+        if (PROJECT_ROOT / relative_path).exists():
             return Path(relative_path).as_posix()
+    return None
+
+
+def ensure_menu_font_asset(zip_relative_path, member_name):
+    font_relative_path = Path(zip_relative_path).with_name(member_name)
+    if (PROJECT_ROOT / font_relative_path).exists():
+        return font_relative_path.as_posix()
+
+    archive_path = PROJECT_ROOT / zip_relative_path
+    if not archive_path.exists():
+        return None
+
+    try:
+        with ZipFile(archive_path) as archive:
+            archive.extract(member_name, archive_path.parent)
+    except Exception:
+        return None
+
+    if (PROJECT_ROOT / font_relative_path).exists():
+        return font_relative_path.as_posix()
     return None
 
 
@@ -42,8 +63,11 @@ class GameMenu:
         self.menu_button_position_top = 0.13
         self.settings_button_scale = (0.2, 0.05)
         self.settings_small_button_scale = (0.07, 0.05)
-        self.title_font = resolve_menu_asset_path(
-            ["assets/RPG UI pack - Demo (by Franuka)/FantasyRPGtext (size 8).ttf"]
+        self.title_font = (
+            ensure_menu_font_asset("fonts/minecraft.zip", "Minecraft.ttf")
+            or resolve_menu_asset_path(
+                ["assets/RPG UI pack - Demo (by Franuka)/FantasyRPGtext (size 8).ttf"]
+            )
         )
         # Keep menu visuals fully opaque to avoid compositor/alpha issues
         # that can make the screen look washed-out or blank on some setups.

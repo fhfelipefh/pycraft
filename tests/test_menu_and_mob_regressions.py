@@ -3,7 +3,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 MAIN_PY = BASE_DIR / "main.py"
-MENU_PY = BASE_DIR / "menu.py"
+MENU_PY = BASE_DIR / "pycraft" / "menu.py"
 
 
 def test_settings_menu_uses_same_button_scale_family_as_main_menu():

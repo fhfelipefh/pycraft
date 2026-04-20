@@ -28,10 +28,10 @@ from ursina import (
     window,
 )
 from ursina.shaders import unlit_shader
-from mob_textures import apply_texture_recursively
-from mob_grounding import compute_grounded_entity_y
-from voxel_accel import get_filtered_custom_positions
-from voxel_chunk import (
+from pycraft.mob_textures import apply_texture_recursively
+from pycraft.mob_grounding import compute_grounded_entity_y
+from pycraft.voxel_accel import get_filtered_custom_positions
+from pycraft.voxel_chunk import (
     BlockHit,
     CHUNK_SIZE,
     build_chunk_mesh,
@@ -42,10 +42,10 @@ from voxel_chunk import (
     iter_chunk_block_positions,
     reverse_triangle_winding,
 )
-from terrain_async_scheduler import DesiredPositionsScheduler
+from pycraft.terrain_async_scheduler import DesiredPositionsScheduler
 from ursina.prefabs.first_person_controller import FirstPersonController
 
-from menu import GameMenu
+from pycraft.menu import GameMenu
 
 # Keep the main window fully opaque to avoid compositor alpha artifacts
 # that can appear as a solid white frame on some Linux setups.

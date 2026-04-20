@@ -2,7 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from voxel_chunk import (
+from pycraft.voxel_chunk import (
     build_chunk_mesh,
     build_texture_atlas,
     chunk_key_from_block,
@@ -201,6 +201,6 @@ def test_reverse_triangle_winding_flips_each_triangle():
 
 
 def build_dummy_tile():
-    from voxel_chunk import AtlasTile
+    from pycraft.voxel_chunk import AtlasTile
 
     return AtlasTile(u0=0.0, v0=0.0, u1=1.0, v1=1.0)

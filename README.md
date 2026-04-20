@@ -13,7 +13,7 @@ PyCraft e um projeto simples inspirado em Minecraft, permitindo ao usuario const
 ## Instalacao
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 O script cria `.venv/`, atualiza o `pip` e instala as dependencias do projeto.
@@ -35,7 +35,7 @@ python main.py
 
 O modulo nativo C++ e obrigatorio para executar o jogo com desempenho aceitavel.
 
-O `./setup.sh` ja compila automaticamente.
+O `./scripts/setup.sh` ja compila automaticamente.
 
 Compilacao manual (se necessario):
 
@@ -46,7 +46,7 @@ python setup.py build_ext --inplace
 cd ..
 ```
 
-Se o modulo não estiver disponivel, `./run.sh` encerra com erro orientando executar `./setup.sh`.
+Se o modulo nao estiver disponivel, `./run.sh` encerra com erro orientando executar `./scripts/setup.sh`.
 
 ## Controles
 

@@ -16,7 +16,7 @@ except Exception:
     except Exception as exc:
         raise ImportError(
             "Modulo nativo obrigatorio nao encontrado: _voxel_native. "
-            "Execute ./setup.sh para instalar dependencias e compilar o modulo C++."
+            "Execute ./scripts/setup.sh para instalar dependencias e compilar o modulo C++."
         ) from exc
 
 

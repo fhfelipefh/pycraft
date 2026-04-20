@@ -1,4 +1,4 @@
-from mob_textures import apply_texture_recursively
+from pycraft.mob_textures import apply_texture_recursively
 
 
 class Node:

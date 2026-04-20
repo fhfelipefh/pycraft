@@ -3,7 +3,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 MAIN_PY = BASE_DIR / "main.py"
-MENU_PY = BASE_DIR / "menu.py"
+MENU_PY = BASE_DIR / "pycraft" / "menu.py"
 
 
 def test_menu_starts_with_title_screen_and_play_button():
@@ -26,3 +26,9 @@ def test_menu_ui_elements_are_drawn_in_front_of_panels():
     assert "position=(0, 0.285, 0.02)" in text
     assert "button.text_entity.scale_x = normal_text_scale" in text
     assert "z=0.02" in text
+
+
+def test_menu_prefers_minecraft_font_from_fonts_folder():
+    text = MENU_PY.read_text(encoding="utf-8")
+    assert 'ensure_menu_font_asset("fonts/minecraft.zip", "Minecraft.ttf")' in text
+    assert 'title_kwargs["font"] = self.title_font' in text

@@ -1,4 +1,4 @@
-import voxel_accel
+from pycraft import voxel_accel
 
 
 def test_flat_ground_positions_matches_expected_size_and_points():
