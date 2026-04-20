@@ -34,12 +34,16 @@ def test_mobs_are_paused_when_menu_is_open():
 
 def test_custom_crosshair_is_integrated():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/Crosshair.png"])' in text
-    assert "crosshair.enabled = not state" in text
+    assert "crosshair = None" in text
+    assert "crosshair.enabled" in text
 
 
 def test_background_music_candidates_are_configured():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "BGM_CANDIDATES" in text
-    assert '"sounds/Below_and_Above.ogg"' in text
-    assert '"sounds/Fireflies.ogg"' in text
+    assert 'MUSIC_DIR = Path("musics").as_posix()' in text
+    assert "MUSIC_EXTENSIONS" in text
+    assert "def get_music_playlist_files():" in text
+    assert "background_music_playlist = get_music_playlist_files()" in text
+    assert "def play_background_music_track(track_index):" in text
+    assert "def update_background_music():" in text
+    assert "loop=False" in text

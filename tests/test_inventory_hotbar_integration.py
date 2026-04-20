@@ -23,3 +23,10 @@ def test_inventory_hotbar_drag_updates_existing_hotbar():
     assert 'texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"])' in text
     assert "inventory_hotbar_buttons.append(slot_button)" in text
     assert 'hotbar_block_indices[target_index] = inventory_drag_block_index[0]' in text
+
+
+def test_hotbar_slots_match_hotbar_texture_layout():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert "HOTBAR_SLOT_SPACING_PX = 40" in text
+    assert "HOTBAR_FIRST_SLOT_CENTER_PX = 21.5" in text
+    assert "slot_spacing = hotbar_bg.scale_x * (HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH)" in text

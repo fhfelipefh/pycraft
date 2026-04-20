@@ -4,7 +4,7 @@ import random
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 
-from panda3d.core import WindowProperties
+from panda3d.core import WindowProperties, loadPrcFileData
 from ursina import (
     Audio,
     Button,
@@ -47,15 +47,67 @@ from ursina.prefabs.first_person_controller import FirstPersonController
 
 from menu import GameMenu
 
+# Keep the main window fully opaque to avoid compositor alpha artifacts
+# that can appear as a solid white frame on some Linux setups.
+loadPrcFileData("", "framebuffer-alpha #f")
+loadPrcFileData("", "alpha-bits 0")
+loadPrcFileData("", "framebuffer-alpha 0")
+loadPrcFileData("", "framebuffer-srgb 0")
+loadPrcFileData("", "background-color 0.06 0.09 0.14 1")
+
 app = Ursina(development_mode=False, editor_ui_enabled=False, fullscreen=False, borderless=False, title="pycraft")
+
+
 BASE_DIR = Path(__file__).resolve().parent
 application.asset_folder = BASE_DIR
 window.fullscreen = False
+window.color = color.rgb(16, 24, 36)
+camera.background_color = color.rgb(16, 24, 36)
+try:
+    app.win.setClearColor((16 / 255, 24 / 255, 36 / 255, 1.0))
+    app.win.setClearColorActive(True)
+except Exception:
+    pass
 
 for ui_name in ("exit_button", "cog_button", "fps_counter", "entity_counter", "collider_counter"):
     ui_element = getattr(window, ui_name, None)
     if ui_element is not None:
         ui_element.enabled = False
+
+for ui_name in ("cog_menu", "editor_ui"):
+    ui_element = getattr(window, ui_name, None)
+    if ui_element is not None:
+        ui_element.enabled = False
+
+
+def cleanup_problematic_ui_quads(destroy_matches=False):
+    for child in camera.ui.children:
+        if not getattr(child, "enabled", False):
+            continue
+        model_name = str(getattr(child, "model", ""))
+        if "quad" not in model_name:
+            continue
+        scale_x = float(getattr(child, "scale_x", 0) or 0)
+        scale_y = float(getattr(child, "scale_y", 0) or 0)
+        if scale_x < 20 or scale_y < 20:
+            continue
+
+        alpha = 255
+        color_value = getattr(child, "color", None)
+        try:
+            raw_alpha = float(color_value[3])
+            alpha = int(raw_alpha * 255) if raw_alpha <= 1 else int(raw_alpha)
+        except Exception:
+            alpha = 255
+
+        if alpha <= 1:
+            if destroy_matches:
+                destroy(child)
+            else:
+                child.enabled = False
+
+
+cleanup_problematic_ui_quads(destroy_matches=True)
 
 TEXTURE_PATH = Path("textures/blocks").as_posix()
 UI_PATH = Path("ui").as_posix()
@@ -63,10 +115,8 @@ SKY_PATH = Path("skybox/generated").as_posix()
 DAMAGE_SOUND_PATH = Path("sounds/damage.wav").as_posix()
 WALK_SOUND_PATH = Path("sounds/walk-sound.wav").as_posix()
 MENU_CLICK_SOUND_PATH = Path("sounds/Click_stereo.ogg.mp3").as_posix()
-BGM_CANDIDATES = [
-    Path("sounds/Below_and_Above.ogg").as_posix(),
-    Path("sounds/Fireflies.ogg").as_posix(),
-]
+MUSIC_DIR = Path("musics").as_posix()
+MUSIC_EXTENSIONS = {".mp3", ".ogg", ".wav", ".flac"}
 GROUND_Y = 0
 RENDER_RADIUS = 30
 RENDER_HEIGHT = 12
@@ -83,6 +133,14 @@ CUSTOM_RENDER_CHUNK_HEIGHT = max(1, math.ceil(CUSTOM_RENDER_HEIGHT / CHUNK_SIZE)
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
+HOTBAR_TEXTURE_WIDTH = 364
+HOTBAR_TEXTURE_HEIGHT = 44
+HOTBAR_SELECTOR_TEXTURE_SIZE = 48
+HOTBAR_SLOT_SPACING_PX = 40
+HOTBAR_FIRST_SLOT_CENTER_PX = 21.5
+HOTBAR_BG_SCALE_X = 0.8
+HOTBAR_BG_SCALE_Y = HOTBAR_BG_SCALE_X * (HOTBAR_TEXTURE_HEIGHT / HOTBAR_TEXTURE_WIDTH)
+HOTBAR_SELECTOR_SCALE = HOTBAR_BG_SCALE_X * (HOTBAR_SELECTOR_TEXTURE_SIZE / HOTBAR_TEXTURE_WIDTH)
 MOB_STEP_HEIGHT = 1.15
 MOB_FALL_SPEED = 7.5
 MOB_RESPAWN_FALL_DISTANCE = 18.0
@@ -194,9 +252,29 @@ def get_existing_sound_files(candidates):
     return [sound_file for sound_file in candidates if resolve_asset_path(sound_file).exists()]
 
 
+def get_music_playlist_files():
+    music_root = resolve_asset_path(MUSIC_DIR)
+    if not music_root.exists():
+        return []
+
+    return [
+        Path(MUSIC_DIR, entry.name).as_posix()
+        for entry in sorted(music_root.iterdir(), key=lambda path: path.name.lower())
+        if entry.is_file() and entry.suffix.lower() in MUSIC_EXTENSIONS
+    ]
+
+
 def play_menu_click_sound():
     if resolve_asset_path(MENU_CLICK_SOUND_PATH).exists():
         Audio(MENU_CLICK_SOUND_PATH, autoplay=True, volume=0.35)
+
+
+def approach_value(current, target, max_delta):
+    if current < target:
+        return min(target, current + max_delta)
+    if current > target:
+        return max(target, current - max_delta)
+    return target
 
 
 def get_entity_model_min_y(entity):
@@ -548,7 +626,7 @@ atexit.register(_shutdown_desired_positions_executor)
 
 
 def center_game_window():
-    if window.fullscreen:
+    if is_window_fullscreen():
         return
 
     try:
@@ -570,10 +648,18 @@ def center_game_window():
         pass
 
 
+def is_window_fullscreen():
+    try:
+        return bool(app.win.getProperties().getFullscreen())
+    except Exception:
+        return bool(window.fullscreen)
+
+
 def toggle_fullscreen():
-    window.fullscreen = not window.fullscreen
-    fullscreen_state[0] = window.fullscreen
-    if not window.fullscreen:
+    target_state = not is_window_fullscreen()
+    window.fullscreen = target_state
+    fullscreen_state[0] = target_state
+    if not target_state:
         invoke(center_game_window, delay=0.05)
 
 
@@ -1121,44 +1207,6 @@ chicken_walk_target = [None]
 chicken_walk_speed = 0.9
 chicken_walk_radius = 6.0
 chicken_walk_reach_distance = 0.35
-chicken_animation_time = [0.0]
-chicken_body_bob = [0.0]
-
-chicken_left_leg = Entity(
-    parent=chicken,
-    model="cube",
-    color=color.rgb(92, 68, 34),
-    scale=(0.035, 0.16, 0.035),
-    position=Vec3(-0.05, -0.17, 0.03),
-    origin_y=0.5,
-)
-
-chicken_right_leg = Entity(
-    parent=chicken,
-    model="cube",
-    color=color.rgb(92, 68, 34),
-    scale=(0.035, 0.16, 0.035),
-    position=Vec3(0.05, -0.17, 0.03),
-    origin_y=0.5,
-)
-
-chicken_left_wing = Entity(
-    parent=chicken,
-    model="cube",
-    color=color.rgb(236, 228, 208),
-    scale=(0.05, 0.025, 0.11),
-    position=Vec3(-0.12, 0.03, 0.0),
-    origin_x=0.5,
-)
-
-chicken_right_wing = Entity(
-    parent=chicken,
-    model="cube",
-    color=color.rgb(236, 228, 208),
-    scale=(0.05, 0.025, 0.11),
-    position=Vec3(0.12, 0.03, 0.0),
-    origin_x=-0.5,
-)
 
 
 def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint=0.48):
@@ -1199,23 +1247,6 @@ def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint
 
 def chicken_position_is_blocked(position):
     return mob_position_is_blocked(position, entity=chicken, player_radius=0.75)
-
-
-def update_chicken_animation(move_amount):
-    chicken_animation_time[0] += time.dt * (2.5 + (move_amount * 6.0))
-    walk_cycle = chicken_animation_time[0] * (5.0 if move_amount > 0.01 else 1.6)
-
-    leg_swing = math.sin(walk_cycle) * (28 if move_amount > 0.01 else 5)
-    wing_swing = math.sin(walk_cycle * 1.7) * (18 if move_amount > 0.01 else 3)
-    bob = 0.0
-
-    chicken_left_leg.rotation_x = leg_swing
-    chicken_right_leg.rotation_x = -leg_swing
-    chicken_left_wing.rotation_z = wing_swing
-    chicken_right_wing.rotation_z = -wing_swing
-
-    chicken_body_bob[0] = bob
-    chicken.rotation_z = math.sin(chicken_animation_time[0] * 0.7) * 1.4
 
 
 def get_new_chicken_walk_target():
@@ -1544,13 +1575,11 @@ def update_chicken_walking():
         )
     if not moved:
         chicken_walk_target[0] = get_new_chicken_walk_target()
-        update_chicken_animation(0.0)
         return
 
     if direction.length() > 0:
         chicken.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
 
-    update_chicken_animation(step_distance)
     lift_entity_out_of_blocks(chicken)
 
 sun_visual = Entity(
@@ -1572,6 +1601,8 @@ sun_glow = Entity(
 )
 
 player = FirstPersonController()
+if hasattr(player, "height"):
+    player.height = 1.8
 if hasattr(player, "cursor") and player.cursor is not None:
     player.cursor.enabled = False
 player.base_speed = getattr(player, "speed", 5)
@@ -1593,6 +1624,8 @@ highlighted_box[0] = Entity(
 menu = None
 crosshair = None
 background_music = None
+background_music_playlist = get_music_playlist_files()
+background_music_track_index = [0]
 music_enabled = [True]
 music_volume = [0.25]
 fps_overlay = None
@@ -1626,12 +1659,14 @@ def on_menu_toggle(state):
         set_inventory_open(False)
     if crosshair is not None:
         crosshair.enabled = not state and not inventory_open[0]
+    if "hotbar_bg" in globals():
+        set_game_hud_visible(not state and not inventory_open[0])
     if fps_overlay is not None:
         fps_overlay.enabled = fps_overlay_visible[0] and not state
     if fps_overlay_text is not None:
         fps_overlay_text.enabled = fps_overlay_visible[0] and not state
     if state:
-        play_menu_click_sound()
+        highlight_box(None)
 
 
 def toggle_music_enabled():
@@ -1654,8 +1689,47 @@ def set_music_volume_delta(delta):
         background_music.volume = music_volume[0] if music_enabled[0] else 0.0
 
 
+def play_background_music_track(track_index):
+    global background_music
+
+    if not background_music_playlist:
+        background_music = None
+        return
+
+    normalized_index = track_index % len(background_music_playlist)
+    background_music_track_index[0] = normalized_index
+
+    if background_music is not None:
+        try:
+            background_music.stop()
+        except Exception:
+            pass
+
+    background_music = Audio(
+        background_music_playlist[normalized_index],
+        autoplay=True,
+        loop=False,
+        volume=music_volume[0] if music_enabled[0] else 0.0,
+    )
+
+
+def update_background_music():
+    if not background_music_playlist or background_music is None:
+        return
+    if not music_enabled[0]:
+        return
+
+    try:
+        if background_music.playing:
+            return
+    except Exception:
+        pass
+
+    play_background_music_track(background_music_track_index[0] + 1)
+
+
 def is_game_paused():
-    return bool(menu and menu.menu_open)
+    return bool(menu and menu.is_blocking_gameplay())
 
 
 menu = GameMenu(
@@ -1668,23 +1742,10 @@ menu = GameMenu(
     set_music_volume_delta,
 )
 
-crosshair = Entity(
-    parent=camera.ui,
-    model="quad",
-    texture=resolve_existing_asset_path([f"{UI_PATH}/Crosshair.png"]) or "white_cube",
-    position=(0, 0),
-    scale=(0.022, 0.022),
-    z=-0.5,
-)
+crosshair = None
 
-available_bgm_files = get_existing_sound_files(BGM_CANDIDATES)
-if available_bgm_files:
-    background_music = Audio(
-        random.choice(available_bgm_files),
-        autoplay=True,
-        loop=True,
-        volume=music_volume[0],
-    )
+if background_music_playlist:
+    play_background_music_track(0)
 
 fps_overlay = Entity(
     parent=camera.ui,
@@ -1709,7 +1770,7 @@ hotbar_bg = Entity(
     model="quad",
     texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar.png"]) or "white_cube",
     position=(0, -0.45, 1),
-    scale=(0.8, 0.0967),
+    scale=(HOTBAR_BG_SCALE_X, HOTBAR_BG_SCALE_Y),
 )
 
 hotbar_selector = Entity(
@@ -1717,7 +1778,7 @@ hotbar_selector = Entity(
     model="quad",
     texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"]) or "white_cube",
     position=(0, -0.45, 0.9),
-    scale=(0.1055, 0.1055),
+    scale=(HOTBAR_SELECTOR_SCALE, HOTBAR_SELECTOR_SCALE),
 )
 
 hotbar_icons = []
@@ -1727,8 +1788,10 @@ hud_armor_icons = []
 
 
 def create_hotbar_ui():
-    slot_spacing = hotbar_bg.scale_x * (40 / 364)
-    start_x = hotbar_bg.x - (hotbar_bg.scale_x / 2) + (hotbar_bg.scale_x * (21.5 / 364))
+    slot_spacing = hotbar_bg.scale_x * (HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH)
+    start_x = hotbar_bg.x - (hotbar_bg.scale_x / 2) + (
+        hotbar_bg.scale_x * (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH)
+    )
     icon_scale = (slot_spacing * 0.78, hotbar_bg.scale_y * 0.72)
     icon_y = hotbar_bg.y + (hotbar_bg.scale_y * 0.015)
 
@@ -1839,6 +1902,25 @@ def clear_inventory_drag():
     inventory_drag_block_index[0] = None
     if inventory_drag_icon[0] is not None:
         inventory_drag_icon[0].enabled = False
+
+
+def set_inventory_entities_enabled(enabled):
+    if inventory_card[0] is not None:
+        inventory_card[0].enabled = enabled
+    if inventory_hotbar_selector[0] is not None:
+        inventory_hotbar_selector[0].enabled = enabled
+    if inventory_player_preview[0] is not None:
+        inventory_player_preview[0].enabled = enabled
+
+    for button in inventory_hotbar_buttons:
+        button.enabled = enabled
+    for icon in inventory_hotbar_icons:
+        icon.enabled = enabled
+
+    for button in inventory_slot_buttons:
+        button.enabled = enabled
+    for icon in inventory_slot_icons:
+        icon.enabled = enabled
 
 
 def set_game_hud_visible(visible):
@@ -2020,6 +2102,7 @@ def create_inventory_ui():
 
     refresh_inventory_hotbar_preview()
     refresh_inventory_grid()
+    set_inventory_entities_enabled(False)
 
 
 def set_inventory_open(state):
@@ -2028,6 +2111,8 @@ def set_inventory_open(state):
         inventory_backdrop[0].enabled = inventory_open[0]
     if inventory_panel[0] is not None:
         inventory_panel[0].enabled = inventory_open[0]
+
+    set_inventory_entities_enabled(inventory_open[0])
 
     if inventory_open[0]:
         player.enabled = False
@@ -2039,10 +2124,11 @@ def set_inventory_open(state):
         should_enable_player = not is_game_paused()
         player.enabled = should_enable_player
         mouse.locked = should_enable_player
-        set_game_hud_visible(True)
+        set_game_hud_visible(should_enable_player)
         if crosshair is not None:
             crosshair.enabled = should_enable_player
         clear_inventory_drag()
+        update_hotbar_ui()
         return
 
     refresh_inventory_hotbar_preview()
@@ -2093,27 +2179,25 @@ def create_status_hud():
 create_hotbar_ui()
 update_hotbar_ui()
 create_status_hud()
-create_inventory_ui()
+set_game_hud_visible(False)
+if crosshair is not None:
+    crosshair.enabled = False
+highlight_box(None)
 invoke(center_game_window, delay=0.05)
 
-flash = Entity(
-    parent=camera.ui,
-    model="quad",
-    color=color.rgba(255, 255, 255, 0),
-    scale=(2, 2),
-    z=-100,
-    enabled=True,
-)
+flash = None
 
 
 def respawn_flash():
-    flash.color = color.rgba(255, 255, 255, 180)
     Audio(DAMAGE_SOUND_PATH, autoplay=True)
-    invoke(lambda *_: setattr(flash, "color", color.rgba(255, 255, 255, 0)), 0.25)
 
 
 def input(key):
     global selected_block_index
+
+    if key == "f11":
+        toggle_fullscreen()
+        return
 
     if key == "f3":
         fps_overlay_visible[0] = not fps_overlay_visible[0]
@@ -2127,17 +2211,19 @@ def input(key):
         if inventory_open[0]:
             set_inventory_open(False)
             return
-        if menu:
-            menu.toggle_menu(not menu.menu_open)
+        if menu and menu.handle_escape():
+            return
         return
 
     if key == "e":
-        if menu and menu.menu_open:
+        if menu and menu.is_blocking_gameplay():
             return
+        if inventory_panel[0] is None:
+            create_inventory_ui()
         set_inventory_open(not inventory_open[0])
         return
 
-    if not menu or menu.menu_open:
+    if not menu or menu.is_blocking_gameplay():
         return
 
     if key.isdigit():
@@ -2196,8 +2282,21 @@ def input(key):
 
 
 def update():
+    camera.background_color = color.rgb(16, 24, 36)
+    try:
+        app.win.setClearColor((16 / 255, 24 / 255, 36 / 255, 1.0))
+    except Exception:
+        pass
+    # Defensive workaround: some environments expose a giant transparent UI
+    # quad that renders as opaque white. Hide/destroy it when detected.
+    cleanup_problematic_ui_quads(destroy_matches=False)
+    update_background_music()
+
     sync_active_blocks()
-    update_highlight()
+    if is_game_paused():
+        highlight_box(None)
+    else:
+        update_highlight()
     if inventory_open[0] and inventory_drag_icon[0] is not None and inventory_drag_icon[0].enabled:
         inventory_drag_icon[0].position = Vec3(mouse.position[0], mouse.position[1], -0.35)
     if not is_game_paused():
@@ -2353,6 +2452,5 @@ def update():
             fps_overlay_text.text = f"FPS: {fps_value}"
             fps_timer[0] = 0.0
             fps_frames[0] = 0
-
 
 app.run()
