@@ -28,6 +28,7 @@ from ursina import (
     window,
 )
 from ursina.shaders import unlit_shader
+from pycraft.chicken_mob import ChickenMob, ChickenMobConfig
 from pycraft.mob_textures import apply_texture_recursively
 from pycraft.mob_grounding import compute_grounded_entity_y
 from pycraft.voxel_accel import get_filtered_custom_positions
@@ -278,6 +279,10 @@ def approach_value(current, target, max_delta):
 
 
 def get_entity_model_min_y(entity):
+    override = getattr(entity, "model_min_y_override", None)
+    if override is not None:
+        return float(override)
+
     try:
         tight_bounds = entity.model.get_tight_bounds()
         if tight_bounds:
@@ -289,6 +294,10 @@ def get_entity_model_min_y(entity):
 
 
 def get_entity_model_max_y(entity):
+    override = getattr(entity, "model_max_y_override", None)
+    if override is not None:
+        return float(override)
+
     try:
         tight_bounds = entity.model.get_tight_bounds()
         if tight_bounds:
@@ -310,8 +319,21 @@ def get_top_solid_block_at_position(x, z, probe_from_y, footprint=0.5):
     )
 
 
+def collect_entity_raycast_ignore(entity):
+    ignore = []
+    if entity is None:
+        return tuple(ignore)
+
+    stack = [entity]
+    while stack:
+        current = stack.pop()
+        ignore.append(current)
+        stack.extend(getattr(current, "children", ()))
+    return tuple(ignore)
+
+
 def get_support_top_y_under_entity(entity, probe_height=6.0, probe_distance=24.0):
-    ignore = [entity]
+    ignore = list(collect_entity_raycast_ignore(entity))
     if highlighted_box[0] is not None:
         ignore.append(highlighted_box[0])
 
@@ -353,9 +375,7 @@ def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
 
 
 def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footprint=0.5):
-    ignore = []
-    if ignore_entity is not None:
-        ignore.append(ignore_entity)
+    ignore = list(collect_entity_raycast_ignore(ignore_entity))
     if highlighted_box[0] is not None:
         ignore.append(highlighted_box[0])
 
@@ -1187,28 +1207,6 @@ def return_cloud_to_pool(cloud):
         puff.hide()
     cloud_pool.append(cloud)
 
-chicken_model_path = resolve_existing_asset_or_fallback(["mobs/minecraft-chicken/source/chicken.fbx"])
-chicken_tex_obj = load_texture_or_fallback("mobs/minecraft-chicken/textures/chicken.png")
-chicken = Entity(
-    parent=scene,
-    model=chicken_model_path,
-    texture=chicken_tex_obj,
-    position=Vec3(4, 0.53, 4),
-    scale=0.07,
-    rotation_y=180,
-    unlit=True,
-)
-apply_texture_recursively(chicken, chicken_tex_obj)
-chicken.setTwoSided(True)
-chicken.collider = "box"
-
-chicken_spawn_position = Vec3(chicken.x, chicken.y, chicken.z)
-chicken_walk_target = [None]
-chicken_walk_speed = 0.9
-chicken_walk_radius = 6.0
-chicken_walk_reach_distance = 0.35
-
-
 def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint=0.48):
     player_distance = Vec3(position.x - player.x, 0, position.z - player.z).length()
     if player_distance < player_radius and abs(position.y - player.y) < 1.4:
@@ -1243,21 +1241,6 @@ def mob_position_is_blocked(position, entity=None, player_radius=0.75, footprint
                 return True
 
     return False
-
-
-def chicken_position_is_blocked(position):
-    return mob_position_is_blocked(position, entity=chicken, player_radius=0.75)
-
-
-def get_new_chicken_walk_target():
-    offset_x = random.uniform(-chicken_walk_radius, chicken_walk_radius)
-    offset_z = random.uniform(-chicken_walk_radius, chicken_walk_radius)
-    return Vec3(
-        chicken_spawn_position.x + offset_x,
-        chicken_spawn_position.y,
-        chicken_spawn_position.z + offset_z,
-    )
-
 
 def create_ambient_mob(name, model_path, texture_path, position, scale, walk_speed, walk_radius, rotation_y=180, tint=color.white, player_radius=0.75, ground_offset=0.0, floating=False, use_opacity_map=True, animations=None, unlit=True):
     spawn_position = Vec3(position.x, position.y + ground_offset, position.z)
@@ -1526,61 +1509,19 @@ ambient_mob_states = {
     mob_state["name"]: mob_state for mob_state in ambient_mobs
 }
 
-
-def update_chicken_walking():
-    target = chicken_walk_target[0]
-    apply_mob_gravity(
-        chicken,
-        fallback_position=chicken_spawn_position,
-        footprint=0.42,
-    )
-    if target is None:
-        chicken_walk_target[0] = get_new_chicken_walk_target()
-        return
-
-    to_target = Vec3(target.x - chicken.x, 0, target.z - chicken.z)
-    distance_to_target = to_target.length()
-
-    if distance_to_target <= chicken_walk_reach_distance:
-        chicken_walk_target[0] = get_new_chicken_walk_target()
-        return
-
-    direction = to_target.normalized()
-    step_distance = chicken_walk_speed * time.dt
-    moved, _ = move_entity_with_grounding(
-        chicken,
-        chicken.x + (direction.x * step_distance),
-        chicken.z + (direction.z * step_distance),
-        fallback_position=chicken_spawn_position,
-        player_radius=0.75,
-        footprint=0.42,
-    )
-    if not moved:
-        moved, _ = move_entity_with_grounding(
-            chicken,
-            chicken.x + (direction.x * step_distance),
-            chicken.z,
-            fallback_position=chicken_spawn_position,
-            player_radius=0.75,
-            footprint=0.42,
-        )
-    if not moved:
-        moved, _ = move_entity_with_grounding(
-            chicken,
-            chicken.x,
-            chicken.z + (direction.z * step_distance),
-            fallback_position=chicken_spawn_position,
-            player_radius=0.75,
-            footprint=0.42,
-        )
-    if not moved:
-        chicken_walk_target[0] = get_new_chicken_walk_target()
-        return
-
-    if direction.length() > 0:
-        chicken.rotation_y = math.degrees(math.atan2(direction.x, direction.z))
-
-    lift_entity_out_of_blocks(chicken)
+chicken_mob = ChickenMob(
+    config=ChickenMobConfig(
+        position=(4.0, 0.53, 4.0),
+        rotation_y=180.0,
+    ),
+    resolve_existing_asset_or_fallback=resolve_existing_asset_or_fallback,
+    load_texture_or_fallback=load_texture_or_fallback,
+    apply_mob_gravity=apply_mob_gravity,
+    move_entity_with_grounding=move_entity_with_grounding,
+    lift_entity_out_of_blocks=lift_entity_out_of_blocks,
+    get_top_solid_block_at_position=get_top_solid_block_at_position,
+    get_block_type_at=get_block_type_at,
+)
 
 sun_visual = Entity(
     parent=scene,
@@ -2295,13 +2236,14 @@ def update():
     sync_active_blocks()
     if is_game_paused():
         highlight_box(None)
+        chicken_mob.pause()
     else:
         update_highlight()
     if inventory_open[0] and inventory_drag_icon[0] is not None and inventory_drag_icon[0].enabled:
         inventory_drag_icon[0].position = Vec3(mouse.position[0], mouse.position[1], -0.35)
     if not is_game_paused():
         update_ambient_mobs()
-        update_chicken_walking()
+        chicken_mob.update()
 
     is_running = bool(
         held_keys.get("control")

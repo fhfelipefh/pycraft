@@ -29,7 +29,15 @@ def test_mobs_are_paused_when_menu_is_open():
     assert "def is_game_paused():" in text
     assert "if not is_game_paused():" in text
     assert "update_ambient_mobs()" in text
-    assert "update_chicken_walking()" in text
+    assert "chicken_mob.pause()" in text
+    assert "chicken_mob.update()" in text
+
+
+def test_chicken_runtime_was_extracted_from_main():
+    text = MAIN_PY.read_text(encoding="utf-8")
+    assert "from pycraft.chicken_mob import ChickenMob, ChickenMobConfig" in text
+    assert "def create_articulated_chicken(" not in text
+    assert "def update_chicken_walking(" not in text
 
 
 def test_custom_crosshair_is_integrated():
