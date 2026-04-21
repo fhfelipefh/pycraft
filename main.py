@@ -156,25 +156,25 @@ SEA_LEVEL = 0
 GROUND_Y = SEA_LEVEL
 WORLD_MIN_Y = -48
 WORLD_MAX_Y = 80
-RENDER_RADIUS = 30
+RENDER_RADIUS = 14
 RENDER_HEIGHT = 12
-CUSTOM_RENDER_RADIUS = 88
+CUSTOM_RENDER_RADIUS = 24
 CUSTOM_RENDER_HEIGHT = 24
 RENDER_UNLOAD_PADDING = 1
 PRIORITY_GROUND_RADIUS = 3
 SUN_CYCLE_SECONDS = 20 * 60
 CLOUD_CYCLE_SECONDS = 9 * 60
-BLOCK_INTERACTION_RANGE = 20
+BLOCK_INTERACTION_RANGE = 12
 GROUND_RENDER_CHUNK_RADIUS = max(1, math.ceil(RENDER_RADIUS / CHUNK_SIZE))
 RENDER_CHUNK_HEIGHT = max(1, math.ceil(RENDER_HEIGHT / CHUNK_SIZE))
 CUSTOM_RENDER_CHUNK_RADIUS = max(1, math.ceil(CUSTOM_RENDER_RADIUS / CHUNK_SIZE))
 CUSTOM_RENDER_CHUNK_HEIGHT = max(1, math.ceil(CUSTOM_RENDER_HEIGHT / CHUNK_SIZE))
-CHUNK_CREATE_BUDGET_PER_TICK = 2
-CHUNK_REBUILD_BUDGET_PER_TICK = 4
-WORLD_BOOTSTRAP_TARGET_CHUNKS = 4
+CHUNK_CREATE_BUDGET_PER_TICK = 1
+CHUNK_REBUILD_BUDGET_PER_TICK = 2
+WORLD_BOOTSTRAP_TARGET_CHUNKS = 2
 WORLD_BOOTSTRAP_DELAY_SECONDS = 0.05
 WORLDGEN_PREWARM_THREADS = max(2, min(4, os.cpu_count() or 2))
-WORLDGEN_PREWARM_CHUNKS = 3
+WORLDGEN_PREWARM_CHUNKS = 1
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
@@ -189,6 +189,11 @@ HOTBAR_SELECTOR_SCALE = HOTBAR_BG_SCALE_X * (HOTBAR_SELECTOR_TEXTURE_SIZE / HOTB
 MOB_STEP_HEIGHT = 1.15
 MOB_FALL_SPEED = 7.5
 MOB_RESPAWN_FALL_DISTANCE = 18.0
+ENABLE_AMBIENT_MOBS = False
+ENABLE_CHICKEN_MOB = False
+UI_CLEANUP_INTERVAL_SECONDS = 2.0
+HIGHLIGHT_REFRESH_INTERVAL_SECONDS = 0.05
+SUPPORT_BLOCK_REFRESH_INTERVAL_SECONDS = 0.05
 
 
 def resolve_asset_path(relative_path):
@@ -373,19 +378,7 @@ def collect_entity_raycast_ignore(entity):
 
 
 def get_support_top_y_under_entity(entity, probe_height=6.0, probe_distance=24.0):
-    ignore = list(collect_entity_raycast_ignore(entity))
-    if highlighted_box[0] is not None:
-        ignore.append(highlighted_box[0])
-
-    hit = raycast(
-        Vec3(entity.x, entity.y + probe_height, entity.z),
-        Vec3(0, -1, 0),
-        distance=probe_distance,
-        ignore=tuple(ignore),
-    )
-    if hit.hit and hasattr(hit.entity, "chunk_key"):
-        return float(hit.world_point.y)
-
+    del probe_distance
     support_position = get_top_solid_block_at_position(
         entity.x,
         entity.z,
@@ -415,19 +408,7 @@ def lift_entity_out_of_blocks(entity, footprint=0.5, epsilon=0.01):
 
 
 def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footprint=0.5):
-    ignore = list(collect_entity_raycast_ignore(ignore_entity))
-    if highlighted_box[0] is not None:
-        ignore.append(highlighted_box[0])
-
-    hit = raycast(
-        Vec3(x, probe_from_y, z),
-        Vec3(0, -1, 0),
-        distance=max(4.0, probe_from_y - (WORLD_MIN_Y - 8.0)),
-        ignore=tuple(ignore),
-    )
-    if hit.hit and hasattr(hit.entity, "chunk_key"):
-        return float(hit.world_point.y)
-
+    del ignore_entity
     support_position = get_top_solid_block_at_position(x, z, probe_from_y, footprint=footprint)
     if support_position is None:
         return None
@@ -687,6 +668,10 @@ world_bootstrap_last_ready_chunks = [-1]
 world_bootstrap_last_sync_signature = [None]
 world_bootstrap_error = [None]
 world_bootstrap_focus_position = [None]
+ui_cleanup_cooldown = [0.0]
+highlight_refresh_cooldown = [0.0]
+support_block_refresh_cooldown = [0.0]
+cached_target_block = [None]
 
 active_chunks = {}
 custom_blocks = {}
@@ -1525,25 +1510,44 @@ def highlight_box(block_hit):
 
 
 def update_highlight():
-    highlight_box(get_target_block())
+    highlight_refresh_cooldown[0] -= time.dt
+    if highlight_refresh_cooldown[0] > 0:
+        highlight_box(cached_target_block[0])
+        return
+
+    highlight_refresh_cooldown[0] = HIGHLIGHT_REFRESH_INTERVAL_SECONDS
+    cached_target_block[0] = get_target_block()
+    highlight_box(cached_target_block[0])
 
 
 def get_supporting_block():
-    ignore = [player]
-    if highlighted_box[0] is not None:
-        ignore.append(highlighted_box[0])
-
-    hit = raycast(
-        player.position + Vec3(0, 0.1, 0),
-        Vec3(0, -1, 0),
-        distance=2,
-        ignore=tuple(ignore),
+    support_position = get_top_solid_block_at_position(
+        player.x,
+        player.z,
+        probe_from_y=max(player.y + 1.5, SEA_LEVEL + 4.0),
+        footprint=0.55,
     )
-    if not hit.hit or not hasattr(hit.entity, "chunk_key"):
+    if support_position is None:
         return None
 
-    support_position = world_point_to_block_position(hit.world_point - (hit.world_normal * 0.001))
+    if abs(float(support_position[1]) - player.y) > 1.6:
+        return None
     return get_block_type_at(support_position)
+
+
+def refresh_support_block(force=False):
+    if not world_bootstrap_ready[0]:
+        last_support_block[0] = None
+        return None
+
+    if not force:
+        support_block_refresh_cooldown[0] -= time.dt
+        if support_block_refresh_cooldown[0] > 0:
+            return last_support_block[0]
+
+    support_block_refresh_cooldown[0] = SUPPORT_BLOCK_REFRESH_INTERVAL_SECONDS
+    last_support_block[0] = get_supporting_block()
+    return last_support_block[0]
 
 
 def set_global_light_level(daylight):
@@ -1901,75 +1905,79 @@ def initialize_world_runtime():
 
     log_world_bootstrap("runtime.init.begin")
 
-    ambient_mobs = [
-        create_ambient_mob(
-            "cow",
-            "mobs/minecraft-cow/source/cow.fbx",
-            "mobs/minecraft-cow/textures/cow.png",
-            Vec3(10, 0.53, 6),
-            0.08,
-            0.72,
-            7.0,
-            rotation_y=180,
-            ground_offset=-0.02,
-            player_radius=0.9,
-        ),
-        create_ambient_mob(
-            "sheep",
-            "mobs/minecraft-sheep/source/sheep.fbx",
-            "mobs/minecraft-sheep/textures/sheep.png",
-            Vec3(-7, 0.53, 9),
-            0.08,
-            0.78,
-            6.0,
-            rotation_y=180,
-            ground_offset=-0.02,
-            player_radius=0.8,
-        ),
-        create_ambient_mob(
-            "iron_golem",
-            "mobs/minecraft-iron-golem/source/iron_golem.fbx",
-            "mobs/minecraft-iron-golem/textures/iron_golem.png",
-            Vec3(18, 0.53, 10),
-            0.065,
-            0.52,
-            5.5,
-            rotation_y=180,
-            ground_offset=0.18,
-            player_radius=1.2,
-        ),
-        create_ambient_mob(
-            "spider",
-            "mobs/minecraft-spider/source/spider.fbx",
-            "mobs/minecraft-spider/textures/spider.png",
-            Vec3(-18, 0.53, 4),
-            0.07,
-            0.84,
-            8.0,
-            rotation_y=180,
-            ground_offset=-0.03,
-            player_radius=0.85,
-        ),
-    ]
+    ambient_mobs = []
+    if ENABLE_AMBIENT_MOBS:
+        ambient_mobs = [
+            create_ambient_mob(
+                "cow",
+                "mobs/minecraft-cow/source/cow.fbx",
+                "mobs/minecraft-cow/textures/cow.png",
+                Vec3(10, 0.53, 6),
+                0.08,
+                0.72,
+                7.0,
+                rotation_y=180,
+                ground_offset=-0.02,
+                player_radius=0.9,
+            ),
+            create_ambient_mob(
+                "sheep",
+                "mobs/minecraft-sheep/source/sheep.fbx",
+                "mobs/minecraft-sheep/textures/sheep.png",
+                Vec3(-7, 0.53, 9),
+                0.08,
+                0.78,
+                6.0,
+                rotation_y=180,
+                ground_offset=-0.02,
+                player_radius=0.8,
+            ),
+            create_ambient_mob(
+                "iron_golem",
+                "mobs/minecraft-iron-golem/source/iron_golem.fbx",
+                "mobs/minecraft-iron-golem/textures/iron_golem.png",
+                Vec3(18, 0.53, 10),
+                0.065,
+                0.52,
+                5.5,
+                rotation_y=180,
+                ground_offset=0.18,
+                player_radius=1.2,
+            ),
+            create_ambient_mob(
+                "spider",
+                "mobs/minecraft-spider/source/spider.fbx",
+                "mobs/minecraft-spider/textures/spider.png",
+                Vec3(-18, 0.53, 4),
+                0.07,
+                0.84,
+                8.0,
+                rotation_y=180,
+                ground_offset=-0.03,
+                player_radius=0.85,
+            ),
+        ]
 
     ambient_mob_states = {
         mob_state["name"]: mob_state for mob_state in ambient_mobs
     }
     log_world_bootstrap("runtime.ambient_mobs.ready", count=len(ambient_mob_states))
 
-    chicken_mob = ChickenMob(
-        config=ChickenMobConfig(
-            position=(4.0, 0.53, 4.0),
-            rotation_y=180.0,
-        ),
-        resolve_existing_asset_or_fallback=resolve_existing_asset_or_fallback,
-        load_texture_or_fallback=load_texture_or_fallback,
-        apply_mob_gravity=apply_mob_gravity,
-        move_entity_with_grounding=move_entity_with_grounding,
-        lift_entity_out_of_blocks=lift_entity_out_of_blocks,
-        get_top_solid_block_at_position=get_top_solid_block_at_position,
-        get_block_type_at=get_block_type_at,
-    )
+    chicken_mob = None
+    if ENABLE_CHICKEN_MOB:
+        chicken_mob = ChickenMob(
+            config=ChickenMobConfig(
+                position=(4.0, 0.53, 4.0),
+                rotation_y=180.0,
+            ),
+            resolve_existing_asset_or_fallback=resolve_existing_asset_or_fallback,
+            load_texture_or_fallback=load_texture_or_fallback,
+            apply_mob_gravity=apply_mob_gravity,
+            move_entity_with_grounding=move_entity_with_grounding,
+            lift_entity_out_of_blocks=lift_entity_out_of_blocks,
+            get_top_solid_block_at_position=get_top_solid_block_at_position,
+            get_block_type_at=get_block_type_at,
+        )
 
     world_runtime_initialized[0] = True
     log_world_bootstrap("runtime.init.complete", chicken_ready=chicken_mob is not None)
@@ -2063,7 +2071,10 @@ def start_world_bootstrap():
     log_world_bootstrap("menu.hand_off_to_world", focus=focus_tuple)
     set_world_loading_progress(0)
     if menu is not None:
-        menu.show_loading_screen("Gerando mundo... 0% (0/4 chunks)", 0)
+        menu.show_loading_screen(
+            f"Gerando mundo... 0% (0/{WORLD_BOOTSTRAP_TARGET_CHUNKS} chunks)",
+            0,
+        )
     set_world_loading_visible(False)
 
 
@@ -2214,8 +2225,8 @@ def create_hotbar_ui():
 
 
 def sync_hotbar_layout():
-    slot_spacing = HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH
-    start_x = -0.5 + (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH)
+    slot_spacing = hotbar_bg.scale_x * (HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH)
+    start_x = (-hotbar_bg.scale_x * 0.5) + (hotbar_bg.scale_x * (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH))
     icon_scale = (slot_spacing * 0.78, 0.72)
     icon_y = 0.015
 
@@ -2811,12 +2822,10 @@ def input(key):
 
 
 def update():
-    camera.background_color = color.rgb(16, 24, 36)
-    try:
-        app.win.setClearColor((16 / 255, 24 / 255, 36 / 255, 1.0))
-    except Exception:
-        pass
-    cleanup_problematic_ui_quads(destroy_matches=False)
+    ui_cleanup_cooldown[0] -= time.dt
+    if ui_cleanup_cooldown[0] <= 0:
+        cleanup_problematic_ui_quads(destroy_matches=False)
+        ui_cleanup_cooldown[0] = UI_CLEANUP_INTERVAL_SECONDS
     update_background_music()
 
     if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
@@ -2882,6 +2891,8 @@ def update():
         sync_active_blocks()
 
     if is_game_paused() or not world_bootstrap_ready[0]:
+        cached_target_block[0] = None
+        highlight_refresh_cooldown[0] = 0.0
         highlight_box(None)
         if chicken_mob is not None:
             chicken_mob.pause()
@@ -2998,7 +3009,7 @@ def update():
     set_global_light_level(daylight)
 
     current_grounded = player.grounded if hasattr(player, "grounded") else player.y <= 1
-    support_block = get_supporting_block() if world_bootstrap_ready[0] else None
+    support_block = refresh_support_block() if world_bootstrap_ready[0] else None
     if world_bootstrap_ready[0] and support_block is None:
         predicted_grounded_y = get_grounded_y_for_entity_at(
             player,
@@ -3009,7 +3020,7 @@ def update():
         if predicted_grounded_y is not None and abs(player.y - predicted_grounded_y) < 3.0:
             player.y = predicted_grounded_y
             current_grounded = True
-            support_block = get_supporting_block()
+            support_block = refresh_support_block(force=True)
     last_support_block[0] = support_block
 
     if world_bootstrap_ready[0] and player.y < spawn_point.y - 64:

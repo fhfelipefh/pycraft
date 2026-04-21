@@ -18,10 +18,10 @@ def test_villager_is_not_in_ambient_list_anymore():
     assert "npcs/david_t_pose.fbx" not in text
 
 
-def test_render_distance_was_increased():
+def test_render_distance_was_reduced_for_performance():
     text = MAIN_PY.read_text(encoding="utf-8")
-    assert "RENDER_RADIUS = 30" in text
-    assert "CUSTOM_RENDER_RADIUS = 88" in text
+    assert "RENDER_RADIUS = 14" in text
+    assert "CUSTOM_RENDER_RADIUS = 24" in text
 
 
 def test_mobs_are_paused_when_menu_is_open():

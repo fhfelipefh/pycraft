@@ -23,7 +23,7 @@ def test_main_logs_bootstrap_menu_runtime_and_errors():
     assert 'invoke(start_world_bootstrap, delay=WORLD_BOOTSTRAP_DELAY_SECONDS)' in text
     assert 'world_bootstrap_focus_position[0] = compute_bootstrap_focus_position(player.x, player.z)' in text
     assert 'menu.show_loading_screen("Preparando geracao do mundo...", 0)' in text
-    assert 'menu.show_loading_screen("Gerando mundo... 0% (0/4 chunks)", 0)' in text
+    assert 'f"Gerando mundo... 0% (0/{WORLD_BOOTSTRAP_TARGET_CHUNKS} chunks)"' in text
     assert "menu.update_loading_progress(loading_message, progress_percent)" in text
     assert "menu.hide_loading_screen()" in text
     assert 'log_world_bootstrap_completion("bootstrap.error", error=error_key)' in text
