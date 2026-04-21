@@ -2,7 +2,12 @@ from pathlib import Path
 import math
 import random
 import atexit
+import json
+import os
+import time as stdlib_time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 from panda3d.core import WindowProperties, loadPrcFileData
 from ursina import (
@@ -32,15 +37,17 @@ from pycraft.chicken_mob import ChickenMob, ChickenMobConfig
 from pycraft.mob_textures import apply_texture_recursively
 from pycraft.mob_grounding import compute_grounded_entity_y
 from pycraft.voxel_accel import get_filtered_custom_positions
+from pycraft.worldgen import TerrainGeneratorConfig, WorldGenerator, build_block_palette
+from pycraft.savegame import deserialize_game_state, serialize_game_state
 from pycraft.voxel_chunk import (
     BlockHit,
     CHUNK_SIZE,
     build_chunk_mesh,
     build_texture_atlas,
+    chunk_origin,
     chunk_key_from_block,
     chunk_key_from_world,
     get_top_block_in_column,
-    iter_chunk_block_positions,
     reverse_triangle_winding,
 )
 from pycraft.terrain_async_scheduler import DesiredPositionsScheduler
@@ -94,14 +101,42 @@ def cleanup_problematic_ui_quads(destroy_matches=False):
             continue
 
         alpha = 255
+        red = green = blue = 255
         color_value = getattr(child, "color", None)
         try:
+            red = int(float(color_value[0]) * 255) if float(color_value[0]) <= 1 else int(float(color_value[0]))
+            green = int(float(color_value[1]) * 255) if float(color_value[1]) <= 1 else int(float(color_value[1]))
+            blue = int(float(color_value[2]) * 255) if float(color_value[2]) <= 1 else int(float(color_value[2]))
             raw_alpha = float(color_value[3])
             alpha = int(raw_alpha * 255) if raw_alpha <= 1 else int(raw_alpha)
         except Exception:
             alpha = 255
 
         if alpha <= 1:
+            action = "destroyed" if destroy_matches else "disabled"
+            print(
+                (
+                    "[ui] suspicious full-screen quad "
+                    f"action={action} model={model_name!r} scale=({scale_x:.2f}, {scale_y:.2f}) alpha={alpha}"
+                ),
+                flush=True,
+            )
+            if destroy_matches:
+                destroy(child)
+            else:
+                child.enabled = False
+            continue
+
+        if red >= 245 and green >= 245 and blue >= 245 and alpha >= 245:
+            action = "destroyed" if destroy_matches else "disabled"
+            print(
+                (
+                    "[ui] suspicious bright full-screen quad "
+                    f"action={action} model={model_name!r} scale=({scale_x:.2f}, {scale_y:.2f}) "
+                    f"rgba=({red}, {green}, {blue}, {alpha})"
+                ),
+                flush=True,
+            )
             if destroy_matches:
                 destroy(child)
             else:
@@ -118,7 +153,11 @@ WALK_SOUND_PATH = Path("sounds/walk-sound.wav").as_posix()
 MENU_CLICK_SOUND_PATH = Path("sounds/Click_stereo.ogg.mp3").as_posix()
 MUSIC_DIR = Path("musics").as_posix()
 MUSIC_EXTENSIONS = {".mp3", ".ogg", ".wav", ".flac"}
-GROUND_Y = 0
+SAVEGAME_PATH = Path("config/savegame.json")
+SEA_LEVEL = 0
+GROUND_Y = SEA_LEVEL
+WORLD_MIN_Y = -48
+WORLD_MAX_Y = 80
 RENDER_RADIUS = 30
 RENDER_HEIGHT = 12
 CUSTOM_RENDER_RADIUS = 88
@@ -129,8 +168,15 @@ SUN_CYCLE_SECONDS = 20 * 60
 CLOUD_CYCLE_SECONDS = 9 * 60
 BLOCK_INTERACTION_RANGE = 20
 GROUND_RENDER_CHUNK_RADIUS = max(1, math.ceil(RENDER_RADIUS / CHUNK_SIZE))
+RENDER_CHUNK_HEIGHT = max(1, math.ceil(RENDER_HEIGHT / CHUNK_SIZE))
 CUSTOM_RENDER_CHUNK_RADIUS = max(1, math.ceil(CUSTOM_RENDER_RADIUS / CHUNK_SIZE))
 CUSTOM_RENDER_CHUNK_HEIGHT = max(1, math.ceil(CUSTOM_RENDER_HEIGHT / CHUNK_SIZE))
+CHUNK_CREATE_BUDGET_PER_TICK = 2
+CHUNK_REBUILD_BUDGET_PER_TICK = 4
+WORLD_BOOTSTRAP_TARGET_CHUNKS = 4
+WORLD_BOOTSTRAP_DELAY_SECONDS = 0.05
+WORLDGEN_PREWARM_THREADS = max(2, min(4, os.cpu_count() or 2))
+WORLDGEN_PREWARM_CHUNKS = 6
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
@@ -315,7 +361,7 @@ def get_top_solid_block_at_position(x, z, probe_from_y, footprint=0.5):
         z=z,
         probe_from_y=probe_from_y,
         get_block_type_at=get_block_type_at,
-        ground_y=GROUND_Y,
+        ground_y=WORLD_MIN_Y,
     )
 
 
@@ -382,7 +428,7 @@ def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footpr
     hit = raycast(
         Vec3(x, probe_from_y, z),
         Vec3(0, -1, 0),
-        distance=max(4.0, probe_from_y - (GROUND_Y - 8.0)),
+        distance=max(4.0, probe_from_y - (WORLD_MIN_Y - 8.0)),
         ignore=tuple(ignore),
     )
     if hit.hit and hasattr(hit.entity, "chunk_key"):
@@ -395,7 +441,7 @@ def get_support_top_y_at_position(x, z, probe_from_y, ignore_entity=None, footpr
 
 
 def get_grounded_y_for_entity_at(entity, x, z, probe_from_y=None, footprint=0.5, epsilon=0.01):
-    probe_y = probe_from_y if probe_from_y is not None else max(entity.y + 6.0, GROUND_Y + 8.0)
+    probe_y = probe_from_y if probe_from_y is not None else max(entity.y + 6.0, WORLD_MIN_Y + 12.0)
     support_top = get_support_top_y_at_position(
         x,
         z,
@@ -496,6 +542,19 @@ BLOCK_ATLAS = build_texture_atlas(
 )
 BLOCK_ATLAS_TEXTURE = load_texture(BLOCK_ATLAS.texture_path)
 BLOCK_ATLAS_TEXTURE.filtering = False
+
+TERRAIN_CONFIG = TerrainGeneratorConfig(
+    seed=90210,
+    sea_level=SEA_LEVEL,
+    lava_level=WORLD_MIN_Y + 4,
+    min_y=WORLD_MIN_Y,
+    max_y=WORLD_MAX_Y,
+)
+WORLD_GENERATOR = WorldGenerator.from_config(
+    palette=build_block_palette(BLOCK_TYPES),
+    config=TERRAIN_CONFIG,
+    chunk_size=CHUNK_SIZE,
+)
 
 hotbar_block_indices = list(range(min(HOTBAR_SLOT_COUNT, len(BLOCK_TYPES))))
 while len(hotbar_block_indices) < HOTBAR_SLOT_COUNT:
@@ -623,6 +682,17 @@ current_light_level = [255]
 fps_overlay_visible = [False]
 fps_timer = [0.0]
 fps_frames = [0]
+world_bootstrap_started = [False]
+world_bootstrap_pending = [False]
+world_bootstrap_ready = [False]
+world_runtime_initialized = [False]
+world_bootstrap_started_at = [None]
+world_bootstrap_started_wallclock = [None]
+world_bootstrap_last_loading_message = [None]
+world_bootstrap_last_ready_chunks = [-1]
+world_bootstrap_last_sync_signature = [None]
+world_bootstrap_error = [None]
+world_bootstrap_focus_position = [None]
 
 active_chunks = {}
 custom_blocks = {}
@@ -633,11 +703,18 @@ chunk_visibility_dirty = [True]
 
 desired_positions_executor = ThreadPoolExecutor(max_workers=2)
 desired_positions_scheduler = [None]
+worldgen_prewarm_executor = ThreadPoolExecutor(max_workers=WORLDGEN_PREWARM_THREADS)
+worldgen_prewarm_futures = {}
 
 
 def _shutdown_desired_positions_executor():
     try:
         desired_positions_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+    try:
+        worldgen_prewarm_executor.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
 
@@ -683,6 +760,133 @@ def toggle_fullscreen():
         invoke(center_game_window, delay=0.05)
 
 
+def log_world_bootstrap(event, **fields):
+    wallclock = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    if world_bootstrap_started_at[0] is None:
+        elapsed = "startup"
+    else:
+        elapsed = f"+{(stdlib_time.perf_counter() - world_bootstrap_started_at[0]):.3f}s"
+
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    print(f"[worldgen] {wallclock} {elapsed} {event}{suffix}", flush=True)
+
+
+def get_world_bootstrap_duration_seconds():
+    if world_bootstrap_started_at[0] is None:
+        return None
+    return stdlib_time.perf_counter() - world_bootstrap_started_at[0]
+
+
+def log_world_bootstrap_completion(event, **fields):
+    duration_seconds = get_world_bootstrap_duration_seconds()
+    started_at = None
+    if world_bootstrap_started_wallclock[0] is not None:
+        started_at = world_bootstrap_started_wallclock[0].strftime("%H:%M:%S.%f")[:-3]
+    finished_at = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    completion_fields = dict(fields)
+    completion_fields["started_at"] = started_at
+    completion_fields["finished_at"] = finished_at
+    if duration_seconds is not None:
+        completion_fields["total_duration_s"] = round(duration_seconds, 3)
+
+    log_world_bootstrap(event, **completion_fields)
+
+
+def begin_world_bootstrap_logging():
+    world_bootstrap_started_at[0] = stdlib_time.perf_counter()
+    world_bootstrap_started_wallclock[0] = datetime.now()
+    world_bootstrap_last_loading_message[0] = None
+    world_bootstrap_last_ready_chunks[0] = -1
+    world_bootstrap_last_sync_signature[0] = None
+    world_bootstrap_error[0] = None
+    log_world_bootstrap(
+        "bootstrap.start",
+        seed=TERRAIN_CONFIG.seed,
+        sea_level=SEA_LEVEL,
+        min_y=WORLD_MIN_Y,
+        max_y=WORLD_MAX_Y,
+        target_chunks=WORLD_BOOTSTRAP_TARGET_CHUNKS,
+        started_at=world_bootstrap_started_wallclock[0].strftime("%H:%M:%S.%f")[:-3],
+    )
+
+
+def get_bootstrap_progress_target():
+    target = min(WORLD_BOOTSTRAP_TARGET_CHUNKS, max(1, len(last_desired_chunks[0]) or WORLD_BOOTSTRAP_TARGET_CHUNKS))
+    return max(1, target)
+
+
+def compute_bootstrap_percent(ready_chunks):
+    target = get_bootstrap_progress_target()
+    return int(round((min(max(ready_chunks, 0), target) / target) * 100))
+
+
+def compute_bootstrap_focus_position(x, z):
+    block_x = math.floor(x + 0.5)
+    block_z = math.floor(z + 0.5)
+    column = WORLD_GENERATOR.terrain.sample_column(block_x, block_z)
+    return Vec3(float(x), float(column.surface_height), float(z))
+
+
+def get_chunk_generation_priority(chunk_key, player_chunk):
+    vertical_distance = abs(chunk_key[1] - player_chunk[1])
+    horizontal_distance_sq = (
+        ((chunk_key[0] - player_chunk[0]) ** 2)
+        + ((chunk_key[2] - player_chunk[2]) ** 2)
+    )
+    return (
+        vertical_distance,
+        horizontal_distance_sq,
+        abs(chunk_key[0] - player_chunk[0]) + abs(chunk_key[2] - player_chunk[2]),
+        chunk_key[1],
+        chunk_key[0],
+        chunk_key[2],
+    )
+
+
+def prewarm_chunk_surface_cache(chunk_key):
+    origin_x, origin_y, origin_z = chunk_origin(chunk_key)
+
+    for world_x in range(origin_x, origin_x + CHUNK_SIZE):
+        for world_z in range(origin_z, origin_z + CHUNK_SIZE):
+            column = WORLD_GENERATOR.terrain.sample_column(world_x, world_z)
+            local_min_y = max(origin_y, column.surface_height - 8)
+            local_max_y = min(origin_y + CHUNK_SIZE, column.surface_height + 3)
+            for world_y in range(local_min_y, local_max_y):
+                WORLD_GENERATOR.get_base_block_at((world_x, world_y, world_z))
+
+
+def queue_worldgen_prewarm(render_chunk, desired_chunks):
+    prioritized_chunks = sorted(
+        desired_chunks,
+        key=lambda chunk_key: get_chunk_generation_priority(chunk_key, render_chunk),
+    )
+
+    queued = 0
+    for chunk_key in prioritized_chunks:
+        if queued >= WORLDGEN_PREWARM_CHUNKS:
+            break
+        if chunk_key in worldgen_prewarm_futures:
+            continue
+        future = worldgen_prewarm_executor.submit(prewarm_chunk_surface_cache, chunk_key)
+        worldgen_prewarm_futures[chunk_key] = future
+        queued += 1
+
+
+def drain_worldgen_prewarm():
+    finished = [chunk_key for chunk_key, future in worldgen_prewarm_futures.items() if future.done()]
+    for chunk_key in finished:
+        future = worldgen_prewarm_futures.pop(chunk_key)
+        try:
+            future.result()
+            if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+                log_world_bootstrap("prewarm.ready", chunk=chunk_key)
+        except Exception as exc:
+            if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+                log_world_bootstrap("prewarm.error", chunk=chunk_key, error=repr(exc))
+
+
 def get_block_texture(block_type):
     return block_type["block_texture_path"]
 
@@ -693,6 +897,10 @@ def get_block_icon_texture(block_type):
 
 def get_selected_block_type():
     return BLOCK_TYPES[hotbar_block_indices[selected_block_index]]
+
+
+def get_block_key(block_type):
+    return str(block_type.get("block_texture_path", block_type.get("block_texture", "")))
 
 
 def to_grid_position(position):
@@ -768,13 +976,86 @@ def get_block_type_at(position):
         return None
     if position in custom_blocks:
         return custom_blocks[position]
-    if position[1] == GROUND_Y:
-        return GROUND_BLOCK_TYPE
-    return None
+    return WORLD_GENERATOR.get_base_block_at(position)
 
 
 def get_block_texture_key(block_type):
-    return block_type["block_texture_path"]
+    return get_block_key(block_type)
+
+
+def get_block_type_lookup_by_key():
+    lookup = {}
+    for block_type in BLOCK_TYPES:
+        key = get_block_key(block_type)
+        if key:
+            lookup[key] = block_type
+    return lookup
+
+
+def save_game_state(file_path=SAVEGAME_PATH):
+    save_data = serialize_game_state(
+        player_position=(player.x, player.y, player.z),
+        hotbar_block_indices=hotbar_block_indices,
+        selected_hotbar_slot=selected_block_index,
+        custom_blocks=custom_blocks,
+        removed_blocks=removed_blocks,
+        block_key_for_type=get_block_key,
+        world_seed=TERRAIN_CONFIG.seed,
+    )
+
+    target_path = resolve_asset_path(file_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(json.dumps(save_data, ensure_ascii=True, indent=2), encoding="utf-8")
+    print(f"[save] Partida salva em: {target_path}")
+
+
+def load_game_state(file_path=SAVEGAME_PATH):
+    target_path = resolve_asset_path(file_path)
+    if not target_path.exists():
+        print(f"[save] Nenhum save encontrado em: {target_path}")
+        return False
+
+    payload = json.loads(target_path.read_text(encoding="utf-8"))
+    loaded = deserialize_game_state(payload)
+
+    custom_blocks.clear()
+    custom_blocks_by_chunk.clear()
+    removed_blocks.clear()
+    dirty_chunks.clear()
+
+    block_lookup = get_block_type_lookup_by_key()
+    for position, block_key in loaded["custom_blocks"]:
+        block_type = block_lookup.get(block_key)
+        if block_type is None:
+            continue
+        register_custom_block(position, block_type)
+        mark_dirty_chunks_for_position(position)
+
+    for position in loaded["removed_blocks"]:
+        removed_blocks.add(position)
+        mark_dirty_chunks_for_position(position)
+
+    if TERRAIN_CONFIG.seed != loaded.get("world_seed", TERRAIN_CONFIG.seed):
+        print("[save] Aviso: seed do save difere da seed atual do mundo.")
+
+    loaded_hotbar = loaded.get("hotbar_block_indices", [])
+    if isinstance(loaded_hotbar, list) and len(loaded_hotbar) == HOTBAR_SLOT_COUNT:
+        for index, block_index in enumerate(loaded_hotbar):
+            if 0 <= block_index < len(BLOCK_TYPES):
+                hotbar_block_indices[index] = block_index
+
+    loaded_slot = int(loaded.get("selected_hotbar_slot", selected_block_index))
+    if 0 <= loaded_slot < HOTBAR_SLOT_COUNT:
+        set_selected_hotbar_slot(loaded_slot)
+
+    loaded_position = loaded.get("player_position")
+    if isinstance(loaded_position, tuple) and len(loaded_position) == 3:
+        player.position = Vec3(loaded_position[0], loaded_position[1], loaded_position[2])
+
+    chunk_visibility_dirty[0] = True
+    sync_active_blocks(force=True)
+    print(f"[save] Partida carregada de: {target_path}")
+    return True
 
 
 def register_custom_block(position, block_type):
@@ -793,17 +1074,31 @@ def unregister_custom_block(position):
         custom_blocks_by_chunk.pop(chunk_key, None)
 
 
-def get_chunk_positions_for_mesh(chunk_key):
-    return tuple(
-        iter_chunk_block_positions(
-            chunk_key,
-            GROUND_Y,
-            GROUND_BLOCK_TYPE,
-            custom_blocks_by_chunk.get(chunk_key, ()),
-            custom_blocks,
-            removed_blocks,
-        )
-    )
+def build_chunk_block_lookup(chunk_key):
+    origin_x, origin_y, origin_z = chunk_origin(chunk_key)
+    lookup = {}
+
+    for world_x in range(origin_x - 1, origin_x + CHUNK_SIZE + 1):
+        for world_y in range(origin_y - 1, origin_y + CHUNK_SIZE + 1):
+            for world_z in range(origin_z - 1, origin_z + CHUNK_SIZE + 1):
+                position = (world_x, world_y, world_z)
+                lookup[position] = get_block_type_at(position)
+
+    return lookup
+
+
+def get_chunk_positions_for_mesh(chunk_key, block_lookup):
+    origin_x, origin_y, origin_z = chunk_origin(chunk_key)
+    positions = []
+
+    for world_x in range(origin_x, origin_x + CHUNK_SIZE):
+        for world_y in range(origin_y, origin_y + CHUNK_SIZE):
+            for world_z in range(origin_z, origin_z + CHUNK_SIZE):
+                position = (world_x, world_y, world_z)
+                if block_lookup.get(position) is not None:
+                    positions.append(position)
+
+    return tuple(positions)
 
 
 def mark_chunk_dirty(chunk_key):
@@ -829,6 +1124,8 @@ def create_chunk_entity(chunk_key):
     origin_x = chunk_key[0] * CHUNK_SIZE
     origin_y = chunk_key[1] * CHUNK_SIZE
     origin_z = chunk_key[2] * CHUNK_SIZE
+    if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+        log_world_bootstrap("chunk.create", chunk=chunk_key)
     chunk_entity = Entity(
         parent=scene,
         position=Vec3(origin_x, origin_y, origin_z),
@@ -848,15 +1145,19 @@ def rebuild_chunk_entity(chunk_key):
     if chunk_entity is None:
         return
 
+    block_lookup = build_chunk_block_lookup(chunk_key)
+    positions = get_chunk_positions_for_mesh(chunk_key, block_lookup)
     mesh_data = build_chunk_mesh(
         chunk_key,
-        get_chunk_positions_for_mesh(chunk_key),
-        get_block_type_at,
+        positions,
+        block_lookup.get,
         get_block_texture_key,
         BLOCK_ATLAS.tiles,
     )
 
     if mesh_data.is_empty:
+        if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+            log_world_bootstrap("chunk.empty", chunk=chunk_key, blocks=len(positions))
         chunk_entity.enabled = False
         chunk_entity.collider = None
         chunk_entity.model = None
@@ -882,6 +1183,13 @@ def rebuild_chunk_entity(chunk_key):
     )
     chunk_entity.enabled = True
     apply_lighting_to_entity(chunk_entity)
+    if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+        log_world_bootstrap(
+            "chunk.ready",
+            chunk=chunk_key,
+            blocks=len(positions),
+            faces=mesh_data.face_count,
+        )
     dirty_chunks.discard(chunk_key)
 
 
@@ -893,9 +1201,10 @@ def remove_chunk_entity(chunk_key):
 
 
 def set_block_at(position, block_type):
+    base_block_type = WORLD_GENERATOR.get_base_block_at(position)
     removed_blocks.discard(position)
 
-    if position[1] == GROUND_Y and block_type == GROUND_BLOCK_TYPE:
+    if base_block_type == block_type:
         unregister_custom_block(position)
     else:
         register_custom_block(position, block_type)
@@ -905,28 +1214,15 @@ def set_block_at(position, block_type):
 
 
 def remove_block_at(position):
+    base_block_type = WORLD_GENERATOR.get_base_block_at(position)
     unregister_custom_block(position)
-    if position[1] == GROUND_Y:
+    if base_block_type is not None:
         removed_blocks.add(position)
     else:
         removed_blocks.discard(position)
 
     mark_dirty_chunks_for_position(position)
     chunk_visibility_dirty[0] = True
-
-
-def get_priority_ground_chunks(position):
-    min_chunk_x = math.floor((position[0] - PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
-    max_chunk_x = math.floor((position[0] + PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
-    min_chunk_z = math.floor((position[2] - PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
-    max_chunk_z = math.floor((position[2] + PRIORITY_GROUND_RADIUS) / CHUNK_SIZE)
-    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
-
-    desired = set()
-    for chunk_x in range(min_chunk_x, max_chunk_x + 1):
-        for chunk_z in range(min_chunk_z, max_chunk_z + 1):
-            desired.add((chunk_x, ground_chunk_y, chunk_z))
-    return desired
 
 
 def get_desired_positions(render_cell):
@@ -936,11 +1232,13 @@ def get_desired_positions(render_cell):
     px, py, pz = render_cell
     desired = set()
     player_chunk = chunk_key_from_block(render_cell)
-    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
 
     for delta_x in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
         for delta_z in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
-            desired.add((player_chunk[0] + delta_x, ground_chunk_y, player_chunk[2] + delta_z))
+            if (delta_x * delta_x) + (delta_z * delta_z) > (GROUND_RENDER_CHUNK_RADIUS * GROUND_RENDER_CHUNK_RADIUS):
+                continue
+            for delta_y in range(-RENDER_CHUNK_HEIGHT, RENDER_CHUNK_HEIGHT + 1):
+                desired.add((player_chunk[0] + delta_x, player_chunk[1] + delta_y, player_chunk[2] + delta_z))
 
     filtered_custom_positions = get_filtered_custom_positions(
         custom_blocks.keys(),
@@ -953,7 +1251,6 @@ def get_desired_positions(render_cell):
 
     for position in filtered_custom_positions:
         desired.add(chunk_key_from_block(position))
-        desired.update(get_priority_ground_chunks(position))
 
     return desired
 
@@ -966,11 +1263,13 @@ def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_
     px, py, pz = render_cell
     desired = set()
     player_chunk = chunk_key_from_block(render_cell)
-    ground_chunk_y = chunk_key_from_block((0, GROUND_Y, 0))[1]
 
     for delta_x in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
         for delta_z in range(-GROUND_RENDER_CHUNK_RADIUS, GROUND_RENDER_CHUNK_RADIUS + 1):
-            desired.add((player_chunk[0] + delta_x, ground_chunk_y, player_chunk[2] + delta_z))
+            if (delta_x * delta_x) + (delta_z * delta_z) > (GROUND_RENDER_CHUNK_RADIUS * GROUND_RENDER_CHUNK_RADIUS):
+                continue
+            for delta_y in range(-RENDER_CHUNK_HEIGHT, RENDER_CHUNK_HEIGHT + 1):
+                desired.add((player_chunk[0] + delta_x, player_chunk[1] + delta_y, player_chunk[2] + delta_z))
 
     filtered_custom_positions = get_filtered_custom_positions(
         custom_positions,
@@ -983,7 +1282,6 @@ def get_desired_positions_from_snapshots(render_cell, custom_positions, removed_
 
     for position in filtered_custom_positions:
         desired.add(chunk_key_from_block(position))
-        desired.update(get_priority_ground_chunks(position))
 
     return desired
 
@@ -995,8 +1293,12 @@ desired_positions_scheduler[0] = DesiredPositionsScheduler(
 
 
 def sync_active_blocks(force=False):
-    render_cell = get_render_cell(player.position)
-    render_chunk = get_render_chunk(player.position)
+    render_position = player.position
+    if (world_bootstrap_pending[0] or (world_bootstrap_started[0] and not world_bootstrap_ready[0])) and world_bootstrap_focus_position[0] is not None:
+        render_position = world_bootstrap_focus_position[0]
+
+    render_cell = get_render_cell(render_position)
+    render_chunk = get_render_chunk(render_position)
     desired_chunks = last_desired_chunks[0]
     needs_visibility_refresh = force or chunk_visibility_dirty[0] or render_chunk != last_render_chunk[0]
 
@@ -1011,31 +1313,79 @@ def sync_active_blocks(force=False):
             )
             desired_chunks = desired_positions_scheduler[0].consume(render_cell)
             if desired_chunks is None:
+                if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+                    signature = ("waiting", render_cell, len(dirty_chunks))
+                    if world_bootstrap_last_sync_signature[0] != signature:
+                        world_bootstrap_last_sync_signature[0] = signature
+                        log_world_bootstrap(
+                            "chunks.waiting_scheduler",
+                            render_cell=render_cell,
+                            dirty=len(dirty_chunks),
+                        )
                 for chunk_key in tuple(dirty_chunks):
                     if chunk_key in active_chunks:
                         rebuild_chunk_entity(chunk_key)
                 return
 
         current_chunks = set(active_chunks)
+        if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+            queue_worldgen_prewarm(render_chunk, desired_chunks)
+        if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+            signature = (
+                "plan",
+                len(desired_chunks),
+                len(current_chunks),
+                len(dirty_chunks),
+                force,
+                render_chunk,
+            )
+            if world_bootstrap_last_sync_signature[0] != signature:
+                world_bootstrap_last_sync_signature[0] = signature
+                log_world_bootstrap(
+                    "chunks.sync_plan",
+                    desired=len(desired_chunks),
+                    active=len(current_chunks),
+                    dirty=len(dirty_chunks),
+                    force=force,
+                    render_chunk=render_chunk,
+                )
         for chunk_key in current_chunks - desired_chunks:
             remove_chunk_entity(chunk_key)
 
-        for chunk_key in desired_chunks - current_chunks:
+        ordered_new_chunks = sorted(
+            desired_chunks - current_chunks,
+            key=lambda chunk_key: get_chunk_generation_priority(chunk_key, render_chunk),
+        )
+
+        created_count = 0
+        for chunk_key in ordered_new_chunks:
             create_chunk_entity(chunk_key)
+            created_count += 1
+            if not force and created_count >= CHUNK_CREATE_BUDGET_PER_TICK:
+                break
 
         last_render_chunk[0] = render_chunk
         last_render_cell[0] = render_cell
         last_desired_chunks[0] = desired_chunks
         chunk_visibility_dirty[0] = False
 
+    drain_worldgen_prewarm()
+
+    rebuilt_count = 0
     for chunk_key in tuple(dirty_chunks):
         if chunk_key not in last_desired_chunks[0]:
             dirty_chunks.discard(chunk_key)
             continue
         if chunk_key not in active_chunks:
             create_chunk_entity(chunk_key)
+            rebuilt_count += 1
+            if not force and rebuilt_count >= CHUNK_REBUILD_BUDGET_PER_TICK:
+                break
             continue
         rebuild_chunk_entity(chunk_key)
+        rebuilt_count += 1
+        if not force and rebuilt_count >= CHUNK_REBUILD_BUDGET_PER_TICK:
+            break
 
 
 def get_target_block():
@@ -1324,7 +1674,7 @@ def apply_mob_gravity(entity, fallback_position=None, footprint=0.5):
         entity,
         entity.x,
         entity.z,
-        probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+        probe_from_y=max(entity.y + 6.0, WORLD_MIN_Y + 12.0),
         footprint=footprint,
     )
     if grounded_y is None:
@@ -1335,7 +1685,7 @@ def apply_mob_gravity(entity, fallback_position=None, footprint=0.5):
                 entity,
                 entity.x,
                 entity.z,
-                probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+                probe_from_y=max(entity.y + 6.0, WORLD_MIN_Y + 12.0),
                 footprint=footprint,
             )
             if grounded_y is not None:
@@ -1354,7 +1704,7 @@ def move_entity_with_grounding(entity, next_x, next_z, fallback_position=None, p
         entity,
         next_x,
         next_z,
-        probe_from_y=max(entity.y + 6.0, GROUND_Y + 8.0),
+        probe_from_y=max(entity.y + 6.0, WORLD_MIN_Y + 12.0),
         footprint=footprint,
     )
 
@@ -1454,74 +1804,89 @@ def update_ambient_mobs():
         update_generic_mob_walk(mob_state)
 
 
-ambient_mobs = [
-    create_ambient_mob(
-        "cow",
-        "mobs/minecraft-cow/source/cow.fbx",
-        "mobs/minecraft-cow/textures/cow.png",
-        Vec3(10, 0.53, 6),
-        0.08,
-        0.72,
-        7.0,
-        rotation_y=180,
-        ground_offset=-0.02,
-        player_radius=0.9,
-    ),
-    create_ambient_mob(
-        "sheep",
-        "mobs/minecraft-sheep/source/sheep.fbx",
-        "mobs/minecraft-sheep/textures/sheep.png",
-        Vec3(-7, 0.53, 9),
-        0.08,
-        0.78,
-        6.0,
-        rotation_y=180,
-        ground_offset=-0.02,
-        player_radius=0.8,
-    ),
-    create_ambient_mob(
-        "iron_golem",
-        "mobs/minecraft-iron-golem/source/iron_golem.fbx",
-        "mobs/minecraft-iron-golem/textures/iron_golem.png",
-        Vec3(18, 0.53, 10),
-        0.065,
-        0.52,
-        5.5,
-        rotation_y=180,
-        ground_offset=0.18,
-        player_radius=1.2,
-    ),
-    create_ambient_mob(
-        "spider",
-        "mobs/minecraft-spider/source/spider.fbx",
-        "mobs/minecraft-spider/textures/spider.png",
-        Vec3(-18, 0.53, 4),
-        0.07,
-        0.84,
-        8.0,
-        rotation_y=180,
-        ground_offset=-0.03,
-        player_radius=0.85,
-    ),
-]
+ambient_mob_states = {}
+chicken_mob = None
 
-ambient_mob_states = {
-    mob_state["name"]: mob_state for mob_state in ambient_mobs
-}
 
-chicken_mob = ChickenMob(
-    config=ChickenMobConfig(
-        position=(4.0, 0.53, 4.0),
-        rotation_y=180.0,
-    ),
-    resolve_existing_asset_or_fallback=resolve_existing_asset_or_fallback,
-    load_texture_or_fallback=load_texture_or_fallback,
-    apply_mob_gravity=apply_mob_gravity,
-    move_entity_with_grounding=move_entity_with_grounding,
-    lift_entity_out_of_blocks=lift_entity_out_of_blocks,
-    get_top_solid_block_at_position=get_top_solid_block_at_position,
-    get_block_type_at=get_block_type_at,
-)
+def initialize_world_runtime():
+    global ambient_mob_states, chicken_mob
+    if world_runtime_initialized[0]:
+        return
+
+    log_world_bootstrap("runtime.init.begin")
+
+    ambient_mobs = [
+        create_ambient_mob(
+            "cow",
+            "mobs/minecraft-cow/source/cow.fbx",
+            "mobs/minecraft-cow/textures/cow.png",
+            Vec3(10, 0.53, 6),
+            0.08,
+            0.72,
+            7.0,
+            rotation_y=180,
+            ground_offset=-0.02,
+            player_radius=0.9,
+        ),
+        create_ambient_mob(
+            "sheep",
+            "mobs/minecraft-sheep/source/sheep.fbx",
+            "mobs/minecraft-sheep/textures/sheep.png",
+            Vec3(-7, 0.53, 9),
+            0.08,
+            0.78,
+            6.0,
+            rotation_y=180,
+            ground_offset=-0.02,
+            player_radius=0.8,
+        ),
+        create_ambient_mob(
+            "iron_golem",
+            "mobs/minecraft-iron-golem/source/iron_golem.fbx",
+            "mobs/minecraft-iron-golem/textures/iron_golem.png",
+            Vec3(18, 0.53, 10),
+            0.065,
+            0.52,
+            5.5,
+            rotation_y=180,
+            ground_offset=0.18,
+            player_radius=1.2,
+        ),
+        create_ambient_mob(
+            "spider",
+            "mobs/minecraft-spider/source/spider.fbx",
+            "mobs/minecraft-spider/textures/spider.png",
+            Vec3(-18, 0.53, 4),
+            0.07,
+            0.84,
+            8.0,
+            rotation_y=180,
+            ground_offset=-0.03,
+            player_radius=0.85,
+        ),
+    ]
+
+    ambient_mob_states = {
+        mob_state["name"]: mob_state for mob_state in ambient_mobs
+    }
+    log_world_bootstrap("runtime.ambient_mobs.ready", count=len(ambient_mob_states))
+
+    chicken_mob = ChickenMob(
+        config=ChickenMobConfig(
+            position=(4.0, 0.53, 4.0),
+            rotation_y=180.0,
+        ),
+        resolve_existing_asset_or_fallback=resolve_existing_asset_or_fallback,
+        load_texture_or_fallback=load_texture_or_fallback,
+        apply_mob_gravity=apply_mob_gravity,
+        move_entity_with_grounding=move_entity_with_grounding,
+        lift_entity_out_of_blocks=lift_entity_out_of_blocks,
+        get_top_solid_block_at_position=get_top_solid_block_at_position,
+        get_block_type_at=get_block_type_at,
+    )
+
+    world_runtime_initialized[0] = True
+    log_world_bootstrap("runtime.init.complete", chicken_ready=chicken_mob is not None)
 
 sun_visual = Entity(
     parent=scene,
@@ -1547,9 +1912,9 @@ if hasattr(player, "height"):
 if hasattr(player, "cursor") and player.cursor is not None:
     player.cursor.enabled = False
 player.base_speed = getattr(player, "speed", 5)
-spawn_point = Vec3(player.x, player.y, player.z)
+world_bootstrap_focus_position[0] = compute_bootstrap_focus_position(player.x, player.z)
 set_global_light_level(1.0)
-sync_active_blocks(force=True)
+spawn_point = Vec3(player.x, player.y, player.z)
 highlighted_box[0] = Entity(
     parent=scene,
     model="wireframe_cube",
@@ -1585,6 +1950,10 @@ inventory_drag_icon = [None]
 inventory_drag_origin = [None]
 inventory_drag_block_index = [None]
 inventory_player_preview = [None]
+world_loading_overlay = [None]
+world_loading_text = [None]
+world_loading_bar_bg = [None]
+world_loading_bar_fill = [None]
 
 INVENTORY_TEXTURE_WIDTH = 176
 INVENTORY_TEXTURE_HEIGHT = 166
@@ -1595,19 +1964,45 @@ INVENTORY_ROWS = 3
 INVENTORY_PAGE_SIZE = INVENTORY_COLUMNS * INVENTORY_ROWS
 
 
+def start_world_bootstrap():
+    if world_bootstrap_started[0]:
+        return
+
+    world_bootstrap_pending[0] = False
+    world_bootstrap_started[0] = True
+    begin_world_bootstrap_logging()
+    focus = world_bootstrap_focus_position[0]
+    focus_tuple = None if focus is None else (round(focus.x, 2), round(focus.y, 2), round(focus.z, 2))
+    log_world_bootstrap("menu.hand_off_to_world", focus=focus_tuple)
+    set_world_loading_progress(0)
+    if menu is not None:
+        menu.show_loading_screen("Gerando mundo... 0% (0/4 chunks)", 0)
+    set_world_loading_visible(False)
+
+
 def on_menu_toggle(state):
+    should_show_game_hud = (not state) and world_bootstrap_ready[0] and not inventory_open[0]
     if state and inventory_open[0]:
         set_inventory_open(False)
     if crosshair is not None:
-        crosshair.enabled = not state and not inventory_open[0]
+        crosshair.enabled = should_show_game_hud
     if "hotbar_bg" in globals():
-        set_game_hud_visible(not state and not inventory_open[0])
+        set_game_hud_visible(should_show_game_hud)
     if fps_overlay is not None:
         fps_overlay.enabled = fps_overlay_visible[0] and not state
     if fps_overlay_text is not None:
         fps_overlay_text.enabled = fps_overlay_visible[0] and not state
     if state:
         highlight_box(None)
+    elif not world_bootstrap_started[0] and not world_bootstrap_pending[0]:
+        world_bootstrap_pending[0] = True
+        set_world_loading_progress(0)
+        if menu is not None:
+            menu.show_loading_screen("Preparando geracao do mundo...", 0)
+        set_world_loading_visible(False)
+        player.enabled = False
+        mouse.locked = False
+        invoke(start_world_bootstrap, delay=WORLD_BOOTSTRAP_DELAY_SECONDS)
 
 
 def toggle_music_enabled():
@@ -1875,6 +2270,77 @@ def set_game_hud_visible(visible):
         icon.enabled = visible
 
 
+def create_world_loading_ui():
+    world_loading_overlay[0] = Entity(
+        parent=camera.ui,
+        model="quad",
+        color=color.rgba(10, 16, 24, 220),
+        scale=(2.0, 2.0),
+        z=0.46,
+        enabled=False,
+    )
+    world_loading_overlay[0].always_on_top = True
+    world_loading_text[0] = Text(
+        parent=camera.ui,
+        text="",
+        color=color.white,
+        origin=(0, 0),
+        position=(0, 0.02, 0.45),
+        scale=1.5,
+        enabled=False,
+    )
+    world_loading_text[0].always_on_top = True
+    world_loading_bar_bg[0] = Entity(
+        parent=camera.ui,
+        model="quad",
+        color=color.rgba(255, 255, 255, 50),
+        position=(0, -0.06, 0.45),
+        scale=(0.52, 0.028),
+        enabled=False,
+    )
+    world_loading_bar_bg[0].always_on_top = True
+    world_loading_bar_fill[0] = Entity(
+        parent=world_loading_bar_bg[0],
+        model="quad",
+        color=color.rgb(120, 190, 255),
+        position=(-0.5, 0, -0.01),
+        origin=(-0.5, 0, 0),
+        scale=(0.001, 0.75),
+        enabled=False,
+    )
+    world_loading_bar_fill[0].always_on_top = True
+    log_world_bootstrap("loading_overlay.created")
+
+
+def set_world_loading_visible(visible, message=""):
+    normalized_message = message or ""
+    if (
+        world_bootstrap_last_loading_message[0] != (bool(visible), normalized_message)
+    ):
+        world_bootstrap_last_loading_message[0] = (bool(visible), normalized_message)
+        log_world_bootstrap(
+            "loading_overlay.state",
+            visible=bool(visible),
+            message=normalized_message,
+        )
+    if world_loading_overlay[0] is not None:
+        world_loading_overlay[0].enabled = bool(visible)
+    if world_loading_text[0] is not None:
+        world_loading_text[0].enabled = bool(visible)
+        if message:
+            world_loading_text[0].text = message
+    if world_loading_bar_bg[0] is not None:
+        world_loading_bar_bg[0].enabled = bool(visible)
+    if world_loading_bar_fill[0] is not None:
+        world_loading_bar_fill[0].enabled = bool(visible)
+
+
+def set_world_loading_progress(percent):
+    clamped = max(0.0, min(100.0, float(percent)))
+    if world_loading_bar_fill[0] is not None:
+        world_loading_bar_fill[0].scale_x = max(0.001, clamped / 100.0)
+
+
 def create_inventory_player_preview():
     inventory_player_preview[0] = Entity(
         parent=inventory_card[0],
@@ -2062,7 +2528,7 @@ def set_inventory_open(state):
         if crosshair is not None:
             crosshair.enabled = False
     else:
-        should_enable_player = not is_game_paused()
+        should_enable_player = (not is_game_paused()) and world_bootstrap_ready[0]
         player.enabled = should_enable_player
         mouse.locked = should_enable_player
         set_game_hud_visible(should_enable_player)
@@ -2120,6 +2586,7 @@ def create_status_hud():
 create_hotbar_ui()
 update_hotbar_ui()
 create_status_hud()
+create_world_loading_ui()
 set_game_hud_visible(False)
 if crosshair is not None:
     crosshair.enabled = False
@@ -2146,6 +2613,14 @@ def input(key):
             fps_overlay.enabled = fps_overlay_visible[0] and not is_game_paused()
         if fps_overlay_text is not None:
             fps_overlay_text.enabled = fps_overlay_visible[0] and not is_game_paused()
+        return
+
+    if key == "f5":
+        save_game_state()
+        return
+
+    if key == "f9":
+        load_game_state()
         return
 
     if key == "escape":
@@ -2233,17 +2708,82 @@ def update():
     cleanup_problematic_ui_quads(destroy_matches=False)
     update_background_music()
 
-    sync_active_blocks()
-    if is_game_paused():
+    if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+        try:
+            if not world_runtime_initialized[0]:
+                initialize_world_runtime()
+            sync_active_blocks()
+            ready_chunks = sum(1 for chunk_entity in active_chunks.values() if getattr(chunk_entity, "enabled", False))
+            progress_target = get_bootstrap_progress_target()
+            progress_percent = compute_bootstrap_percent(ready_chunks)
+            if world_bootstrap_last_ready_chunks[0] != ready_chunks:
+                world_bootstrap_last_ready_chunks[0] = ready_chunks
+                log_world_bootstrap(
+                    "bootstrap.progress",
+                    ready_chunks=ready_chunks,
+                    target_chunks=progress_target,
+                    percent=progress_percent,
+                )
+            set_world_loading_progress(progress_percent)
+            loading_message = f"Gerando mundo... {progress_percent}% ({ready_chunks}/{progress_target} chunks)"
+            if menu is not None:
+                menu.update_loading_progress(loading_message, progress_percent)
+            set_world_loading_visible(False)
+            if ready_chunks >= progress_target:
+                world_bootstrap_ready[0] = True
+                set_world_loading_progress(100)
+                set_world_loading_visible(False)
+                if menu is not None:
+                    menu.hide_loading_screen()
+                player_grounded_y = get_grounded_y_for_entity_at(
+                    player,
+                    player.x,
+                    player.z,
+                    probe_from_y=max(player.y + 32.0, SEA_LEVEL + 24.0),
+                )
+                if player_grounded_y is not None:
+                    player.y = player_grounded_y
+                spawn_point.x = player.x
+                spawn_point.y = player.y
+                spawn_point.z = player.z
+                log_world_bootstrap_completion(
+                    "bootstrap.ready",
+                    spawn=(round(player.x, 2), round(player.y, 2), round(player.z, 2)),
+                    active_chunks=len(active_chunks),
+                    visible_chunks=ready_chunks,
+                )
+                if not is_game_paused():
+                    player.enabled = True
+                    mouse.locked = True
+                    set_game_hud_visible(True)
+                    if crosshair is not None:
+                        crosshair.enabled = True
+        except Exception as exc:
+            error_key = repr(exc)
+            if world_bootstrap_error[0] != error_key:
+                world_bootstrap_error[0] = error_key
+                log_world_bootstrap_completion("bootstrap.error", error=error_key)
+                traceback.print_exc()
+            if menu is not None:
+                menu.show_loading_screen("Erro ao gerar mundo. Veja o console.", 100)
+            set_world_loading_visible(False)
+            return
+
+    if world_bootstrap_ready[0]:
+        sync_active_blocks()
+
+    if is_game_paused() or not world_bootstrap_ready[0]:
         highlight_box(None)
-        chicken_mob.pause()
+        if chicken_mob is not None:
+            chicken_mob.pause()
     else:
         update_highlight()
     if inventory_open[0] and inventory_drag_icon[0] is not None and inventory_drag_icon[0].enabled:
         inventory_drag_icon[0].position = Vec3(mouse.position[0], mouse.position[1], -0.35)
-    if not is_game_paused():
+    if world_bootstrap_ready[0] and not is_game_paused():
         update_ambient_mobs()
-        chicken_mob.update()
+        if chicken_mob is not None:
+            chicken_mob.update()
 
     is_running = bool(
         held_keys.get("control")
@@ -2351,10 +2891,10 @@ def update():
     set_global_light_level(daylight)
 
     current_grounded = player.grounded if hasattr(player, "grounded") else player.y <= 1
-    support_block = get_supporting_block()
+    support_block = get_supporting_block() if world_bootstrap_ready[0] else None
     last_support_block[0] = support_block
 
-    if player.y < spawn_point.y - 64:
+    if world_bootstrap_ready[0] and player.y < spawn_point.y - 64:
         player.position = spawn_point
         respawn_flash()
         sync_active_blocks(force=True)

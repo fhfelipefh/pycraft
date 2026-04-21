@@ -52,6 +52,7 @@ class GameMenu:
     ):
         self.menu_open = False
         self.title_open = True
+        self.loading_active = False
         self.player = player
         self.toggle_menu_callback = toggle_menu_callback
         self.fullscreen_callback = fullscreen_callback
@@ -149,6 +150,40 @@ class GameMenu:
             scale=self.menu_button_scale,
             position=(0, -0.23),
             on_click=lambda: (self._play_click(), self.quit_game()),
+        )
+        self.loading_container = Entity(parent=self.title_bg, enabled=False)
+        self.loading_title = Text(
+            parent=self.loading_container,
+            text="GERANDO MUNDO",
+            color=color.rgb(10, 18, 28),
+            origin=(0, 0),
+            position=(0, 0.02, 0.02),
+            scale=1.55,
+            **title_kwargs,
+        )
+        self.loading_status = Text(
+            parent=self.loading_container,
+            text="Preparando...",
+            color=rgba255(178, 216, 255, 255),
+            origin=(0, 0),
+            position=(0, -0.08, 0.02),
+            scale=0.9,
+            **subtitle_kwargs,
+        )
+        self.loading_bar_bg = Entity(
+            parent=self.loading_container,
+            model="quad",
+            color=rgba255(255, 255, 255, 46),
+            position=(0, -0.19, 0.02),
+            scale=(0.58, 0.05),
+        )
+        self.loading_bar_fill = Entity(
+            parent=self.loading_bar_bg,
+            model="quad",
+            color=rgba255(120, 190, 255, 255),
+            position=(-0.5, 0, -0.01),
+            origin=(-0.5, 0, 0),
+            scale=(0.001, 0.72),
         )
 
         self.menu_bg = Entity(
@@ -320,22 +355,32 @@ class GameMenu:
         Audio("sounds/Click_stereo.ogg.mp3", autoplay=True, volume=0.35)
 
     def _sync_state(self, trigger_callback=True):
-        title_or_pause_visible = self.title_open or self.menu_open
-        self.backdrop.enabled = False
-        self.title_bg.enabled = self.title_open and not self.settings_content.enabled
+        title_or_pause_visible = self.title_open or self.menu_open or self.loading_active
+        self.backdrop.enabled = self.loading_active
+        self.title_bg.enabled = (self.title_open or self.loading_active) and not self.settings_content.enabled
         self.menu_bg.enabled = self.menu_open and not self.settings_content.enabled
         self.settings_bg.enabled = self.settings_content.enabled
+        self.loading_container.enabled = self.title_bg.enabled and self.loading_active
+        title_controls_enabled = self.title_bg.enabled and not self.loading_active
+        self.title_header.enabled = title_controls_enabled
+        self.title_text.enabled = title_controls_enabled
+        self.title_subtitle.enabled = title_controls_enabled
+        self.btn_start.enabled = title_controls_enabled
+        self.btn_title_settings.enabled = title_controls_enabled
+        self.btn_title_exit.enabled = title_controls_enabled
         self.player.enabled = not self.is_blocking_gameplay()
         mouse.locked = not self.is_blocking_gameplay()
-        if not title_or_pause_visible and not self.settings_content.enabled:
+        if not title_or_pause_visible and not self.settings_content.enabled and not self.loading_active:
             self.backdrop.enabled = False
         if trigger_callback:
             self.toggle_menu_callback(self.is_blocking_gameplay())
 
     def is_blocking_gameplay(self):
-        return self.title_open or self.menu_open or self.settings_content.enabled
+        return self.title_open or self.menu_open or self.settings_content.enabled or self.loading_active
 
     def handle_escape(self):
+        if self.loading_active:
+            return True
         if self.settings_content.enabled:
             self._play_click()
             self.close_settings()
@@ -361,8 +406,10 @@ class GameMenu:
         self._sync_state(trigger_callback=trigger_callback)
 
     def start_game(self):
+        print("[menu] start_game clicked", flush=True)
         self.title_open = False
         self.menu_open = False
+        self.loading_active = False
         self.settings_content.enabled = False
         self.settings_bg.enabled = False
         self._sync_state(trigger_callback=True)
@@ -401,3 +448,21 @@ class GameMenu:
 
     def quit_game(self):
         sys.exit()
+
+    def show_loading_screen(self, message="Preparando...", progress=0.0):
+        self.loading_active = True
+        self.title_open = False
+        self.menu_open = False
+        self.settings_content.enabled = False
+        self.settings_bg.enabled = False
+        self.update_loading_progress(message, progress)
+        self._sync_state(trigger_callback=False)
+
+    def update_loading_progress(self, message, progress):
+        self.loading_status.text = message
+        clamped = max(0.0, min(100.0, float(progress)))
+        self.loading_bar_fill.scale_x = max(0.001, clamped / 100.0)
+
+    def hide_loading_screen(self):
+        self.loading_active = False
+        self._sync_state(trigger_callback=False)
