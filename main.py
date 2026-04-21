@@ -2226,12 +2226,14 @@ def create_hotbar_ui():
 
 def sync_hotbar_layout():
     slot_spacing = hotbar_bg.scale_x * (HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH)
-    start_x = (-hotbar_bg.scale_x * 0.5) + (hotbar_bg.scale_x * (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH))
-    icon_scale = (slot_spacing * 0.78, 0.72)
+    local_slot_spacing = slot_spacing / max(hotbar_bg.scale_x, 1e-6)
+    start_x = -0.5 + (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH)
+    icon_scale = (local_slot_spacing * 0.78, 0.72)
     icon_y = 0.015
+    icon_z = -0.02
 
     for index in range(HOTBAR_SLOT_COUNT):
-        slot_x = start_x + (index * slot_spacing)
+        slot_x = start_x + (index * local_slot_spacing)
         if index < len(hotbar_slot_positions):
             hotbar_slot_positions[index] = slot_x
         else:
@@ -2239,7 +2241,7 @@ def sync_hotbar_layout():
 
         if index < len(hotbar_icons):
             icon_entity = hotbar_icons[index]
-            icon_entity.position = (slot_x, icon_y, 0.8)
+            icon_entity.position = (slot_x, icon_y, icon_z)
             icon_entity.scale = icon_scale
         else:
             hotbar_icons.append(
@@ -2247,7 +2249,7 @@ def sync_hotbar_layout():
                     parent=hotbar_bg,
                     model="quad",
                     texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[index]]),
-                    position=(slot_x, icon_y, 0.8),
+                    position=(slot_x, icon_y, icon_z),
                     scale=icon_scale,
                 )
             )
