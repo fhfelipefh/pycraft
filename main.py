@@ -55,8 +55,6 @@ from ursina.prefabs.first_person_controller import FirstPersonController
 
 from pycraft.menu import GameMenu
 
-# Keep the main window fully opaque to avoid compositor alpha artifacts
-# that can appear as a solid white frame on some Linux setups.
 loadPrcFileData("", "framebuffer-alpha #f")
 loadPrcFileData("", "alpha-bits 0")
 loadPrcFileData("", "framebuffer-alpha 0")
@@ -176,7 +174,7 @@ CHUNK_REBUILD_BUDGET_PER_TICK = 4
 WORLD_BOOTSTRAP_TARGET_CHUNKS = 4
 WORLD_BOOTSTRAP_DELAY_SECONDS = 0.05
 WORLDGEN_PREWARM_THREADS = max(2, min(4, os.cpu_count() or 2))
-WORLDGEN_PREWARM_CHUNKS = 6
+WORLDGEN_PREWARM_CHUNKS = 3
 WALK_SPEED_MULTIPLIER = 1.0
 RUN_SPEED_MULTIPLIER = 1.5
 HOTBAR_SLOT_COUNT = 9
@@ -200,8 +198,6 @@ def resolve_asset_path(relative_path):
 def resolve_existing_asset_path(candidates):
     for relative_path in candidates:
         if resolve_asset_path(relative_path).exists():
-            # Ursina resolves textures relative to application.asset_folder.
-            # Returning relative paths avoids Panda warnings for missing absolute textures.
             return relative_path
     return None
 
@@ -236,7 +232,7 @@ def _compose_rgba_if_opacity_exists(diffuse_path: str) -> str:
     Pillow is not available.
     """
     try:
-        from PIL import Image  # optional dependency
+        from PIL import Image
     except Exception:
         return diffuse_path
 
@@ -271,7 +267,6 @@ def load_texture_or_fallback(path_like, use_opacity_map=True):
     cases where models render totalmente brancos (sem textura) em alguns
     drivers/versões.
     """
-    # Compose RGBA with *_opacity.png when disponível
     candidate = _compose_rgba_if_opacity_exists(path_like) if use_opacity_map else path_like
     resolved = resolve_existing_asset_or_fallback([candidate])
     try:
@@ -282,7 +277,6 @@ def load_texture_or_fallback(path_like, use_opacity_map=True):
 
 
 def apply_texture_recursively(entity, texture_obj):
-    # Aplica a textura no entity e em todos os filhos.
     try:
         entity.texture = texture_obj
     except Exception:
@@ -705,6 +699,9 @@ desired_positions_executor = ThreadPoolExecutor(max_workers=2)
 desired_positions_scheduler = [None]
 worldgen_prewarm_executor = ThreadPoolExecutor(max_workers=WORLDGEN_PREWARM_THREADS)
 worldgen_prewarm_futures = {}
+chunk_mesh_executor = ThreadPoolExecutor(max_workers=max(2, min(4, os.cpu_count() or 2)))
+chunk_mesh_futures = {}
+chunk_mesh_versions = {}
 
 
 def _shutdown_desired_positions_executor():
@@ -715,6 +712,11 @@ def _shutdown_desired_positions_executor():
 
     try:
         worldgen_prewarm_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+    try:
+        chunk_mesh_executor.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
 
@@ -1087,6 +1089,28 @@ def build_chunk_block_lookup(chunk_key):
     return lookup
 
 
+def build_chunk_block_lookup_snapshot(chunk_key, custom_blocks_snapshot, removed_blocks_snapshot):
+    origin_x, origin_y, origin_z = chunk_origin(chunk_key)
+    lookup = {}
+    custom_lookup = dict(custom_blocks_snapshot)
+    removed_lookup = set(removed_blocks_snapshot)
+
+    def get_block_type_at_snapshot(position):
+        if position in removed_lookup:
+            return None
+        if position in custom_lookup:
+            return custom_lookup[position]
+        return WORLD_GENERATOR.get_base_block_at(position)
+
+    for world_x in range(origin_x - 1, origin_x + CHUNK_SIZE + 1):
+        for world_y in range(origin_y - 1, origin_y + CHUNK_SIZE + 1):
+            for world_z in range(origin_z - 1, origin_z + CHUNK_SIZE + 1):
+                position = (world_x, world_y, world_z)
+                lookup[position] = get_block_type_at_snapshot(position)
+
+    return lookup
+
+
 def get_chunk_positions_for_mesh(chunk_key, block_lookup):
     origin_x, origin_y, origin_z = chunk_origin(chunk_key)
     positions = []
@@ -1102,6 +1126,7 @@ def get_chunk_positions_for_mesh(chunk_key, block_lookup):
 
 
 def mark_chunk_dirty(chunk_key):
+    chunk_mesh_versions[chunk_key] = chunk_mesh_versions.get(chunk_key, 0) + 1
     dirty_chunks.add(chunk_key)
 
 
@@ -1145,7 +1170,24 @@ def rebuild_chunk_entity(chunk_key):
     if chunk_entity is None:
         return
 
-    block_lookup = build_chunk_block_lookup(chunk_key)
+    if chunk_key in chunk_mesh_futures:
+        future = chunk_mesh_futures[chunk_key]
+        if not future.done():
+            return
+
+    if chunk_key not in chunk_mesh_futures:
+        chunk_mesh_versions.setdefault(chunk_key, 0)
+        chunk_mesh_futures[chunk_key] = chunk_mesh_executor.submit(
+            build_chunk_mesh_snapshot,
+            chunk_key,
+            tuple(custom_blocks.items()),
+            tuple(removed_blocks),
+            chunk_mesh_versions[chunk_key],
+        )
+
+
+def build_chunk_mesh_snapshot(chunk_key, custom_blocks_snapshot, removed_blocks_snapshot, version):
+    block_lookup = build_chunk_block_lookup_snapshot(chunk_key, custom_blocks_snapshot, removed_blocks_snapshot)
     positions = get_chunk_positions_for_mesh(chunk_key, block_lookup)
     mesh_data = build_chunk_mesh(
         chunk_key,
@@ -1154,6 +1196,15 @@ def rebuild_chunk_entity(chunk_key):
         get_block_texture_key,
         BLOCK_ATLAS.tiles,
     )
+    return version, positions, mesh_data
+
+
+def apply_chunk_mesh_result(chunk_key, version, positions, mesh_data):
+    chunk_entity = active_chunks.get(chunk_key)
+    if chunk_entity is None:
+        return
+    if chunk_mesh_versions.get(chunk_key, 0) != version:
+        return
 
     if mesh_data.is_empty:
         if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
@@ -1193,10 +1244,29 @@ def rebuild_chunk_entity(chunk_key):
     dirty_chunks.discard(chunk_key)
 
 
+def drain_chunk_mesh_futures():
+    for chunk_key, future in tuple(chunk_mesh_futures.items()):
+        if not future.done():
+            continue
+
+        chunk_mesh_futures.pop(chunk_key, None)
+        try:
+            version, positions, mesh_data = future.result()
+        except Exception:
+            traceback.print_exc()
+            continue
+
+        apply_chunk_mesh_result(chunk_key, version, positions, mesh_data)
+
+        if chunk_key in dirty_chunks and chunk_key in active_chunks:
+            rebuild_chunk_entity(chunk_key)
+
+
 def remove_chunk_entity(chunk_key):
     chunk_entity = active_chunks.pop(chunk_key, None)
     if chunk_entity is not None:
         destroy(chunk_entity)
+    chunk_mesh_futures.pop(chunk_key, None)
     dirty_chunks.discard(chunk_key)
 
 
@@ -1300,7 +1370,24 @@ def sync_active_blocks(force=False):
     render_cell = get_render_cell(render_position)
     render_chunk = get_render_chunk(render_position)
     desired_chunks = last_desired_chunks[0]
-    needs_visibility_refresh = force or chunk_visibility_dirty[0] or render_chunk != last_render_chunk[0]
+    bootstrap_target_chunks = 0
+    bootstrap_ready_chunks = 0
+    if world_bootstrap_started[0] and not world_bootstrap_ready[0]:
+        bootstrap_target_chunks = get_bootstrap_progress_target()
+        bootstrap_ready_chunks = sum(1 for chunk_entity in active_chunks.values() if getattr(chunk_entity, "enabled", False))
+
+    bootstrap_needs_more_chunks = (
+        world_bootstrap_started[0]
+        and not world_bootstrap_ready[0]
+        and bootstrap_ready_chunks < bootstrap_target_chunks
+    )
+
+    needs_visibility_refresh = (
+        force
+        or chunk_visibility_dirty[0]
+        or render_chunk != last_render_chunk[0]
+        or bootstrap_needs_more_chunks
+    )
 
     if needs_visibility_refresh:
         if force:
@@ -1325,6 +1412,7 @@ def sync_active_blocks(force=False):
                 for chunk_key in tuple(dirty_chunks):
                     if chunk_key in active_chunks:
                         rebuild_chunk_entity(chunk_key)
+                drain_chunk_mesh_futures()
                 return
 
         current_chunks = set(active_chunks)
@@ -1370,6 +1458,7 @@ def sync_active_blocks(force=False):
         chunk_visibility_dirty[0] = False
 
     drain_worldgen_prewarm()
+    drain_chunk_mesh_futures()
 
     rebuilt_count = 0
     for chunk_key in tuple(dirty_chunks):
@@ -1490,7 +1579,6 @@ cloud_layer_texture = resolve_existing_asset_or_fallback(
 
 sky_base = Sky(texture=sky_base_texture)
 
-# Procedural cloud system: one dense pass with deterministic noise and soft fade.
 def cloud_noise(grid_x, grid_z, salt=0):
     value = math.sin((grid_x * 127.1) + (grid_z * 311.7) + (salt * 74.7)) * 43758.5453
     return value - math.floor(value)
@@ -1507,7 +1595,7 @@ CLOUD_MAX_SCALE = 760
 CLOUD_MIN_ALPHA = 72
 CLOUD_MAX_ALPHA = 240
 
-active_clouds = {}  # Key: (grid_x, grid_z), Value: Entity
+active_clouds = {}
 cloud_pool = []
 
 
@@ -1613,7 +1701,6 @@ def create_ambient_mob(name, model_path, texture_path, position, scale, walk_spe
     mob.collider = "box"
     grounded_y = mob.y
     if not floating:
-        # Garante que o mob não nasça enterrado no terreno/blocos.
         if lift_entity_out_of_blocks(mob):
             grounded_y = mob.y
 
@@ -1654,7 +1741,6 @@ def set_mob_animation(mob_state, animation_key):
     try:
         mob.model = model_path
     except Exception:
-        # Mantém o modelo atual quando a animação/modelo não é compatível.
         return
     tex_obj = mob_state.get("texture_obj")
     if tex_obj is not None:
@@ -1929,6 +2015,7 @@ highlighted_box[0] = Entity(
 
 menu = None
 crosshair = None
+game_crosshair = None
 background_music = None
 background_music_playlist = get_music_playlist_files()
 background_music_track_index = [0]
@@ -1984,8 +2071,6 @@ def on_menu_toggle(state):
     should_show_game_hud = (not state) and world_bootstrap_ready[0] and not inventory_open[0]
     if state and inventory_open[0]:
         set_inventory_open(False)
-    if crosshair is not None:
-        crosshair.enabled = should_show_game_hud
     if "hotbar_bg" in globals():
         set_game_hud_visible(should_show_game_hud)
     if fps_overlay is not None:
@@ -2000,7 +2085,7 @@ def on_menu_toggle(state):
         if menu is not None:
             menu.show_loading_screen("Preparando geracao do mundo...", 0)
         set_world_loading_visible(False)
-        player.enabled = False
+        set_player_enabled(False)
         mouse.locked = False
         invoke(start_world_bootstrap, delay=WORLD_BOOTSTRAP_DELAY_SECONDS)
 
@@ -2078,8 +2163,6 @@ menu = GameMenu(
     set_music_volume_delta,
 )
 
-crosshair = None
-
 if background_music_playlist:
     play_background_music_track(0)
 
@@ -2110,11 +2193,11 @@ hotbar_bg = Entity(
 )
 
 hotbar_selector = Entity(
-    parent=camera.ui,
+    parent=hotbar_bg,
     model="quad",
     texture=resolve_existing_asset_path([f"{UI_PATH}/Hotbar_selector.png"]) or "white_cube",
-    position=(0, -0.45, 0.9),
-    scale=(HOTBAR_SELECTOR_SCALE, HOTBAR_SELECTOR_SCALE),
+    position=(0, 0.0, -0.1),
+    scale=(HOTBAR_SELECTOR_SCALE / HOTBAR_BG_SCALE_X, HOTBAR_SELECTOR_SCALE / HOTBAR_BG_SCALE_Y),
 )
 
 hotbar_icons = []
@@ -2124,25 +2207,39 @@ hud_armor_icons = []
 
 
 def create_hotbar_ui():
-    slot_spacing = hotbar_bg.scale_x * (HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH)
-    start_x = hotbar_bg.x - (hotbar_bg.scale_x / 2) + (
-        hotbar_bg.scale_x * (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH)
-    )
-    icon_scale = (slot_spacing * 0.78, hotbar_bg.scale_y * 0.72)
-    icon_y = hotbar_bg.y + (hotbar_bg.scale_y * 0.015)
+    hotbar_slot_positions.clear()
+    hotbar_icons.clear()
+
+    sync_hotbar_layout()
+
+
+def sync_hotbar_layout():
+    slot_spacing = HOTBAR_SLOT_SPACING_PX / HOTBAR_TEXTURE_WIDTH
+    start_x = -0.5 + (HOTBAR_FIRST_SLOT_CENTER_PX / HOTBAR_TEXTURE_WIDTH)
+    icon_scale = (slot_spacing * 0.78, 0.72)
+    icon_y = 0.015
 
     for index in range(HOTBAR_SLOT_COUNT):
         slot_x = start_x + (index * slot_spacing)
-        hotbar_slot_positions.append(slot_x)
-        hotbar_icons.append(
-            Entity(
-                parent=camera.ui,
-                model="quad",
-                texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[index]]),
-                position=(slot_x, icon_y, 0.8),
-                scale=icon_scale,
+        if index < len(hotbar_slot_positions):
+            hotbar_slot_positions[index] = slot_x
+        else:
+            hotbar_slot_positions.append(slot_x)
+
+        if index < len(hotbar_icons):
+            icon_entity = hotbar_icons[index]
+            icon_entity.position = (slot_x, icon_y, 0.8)
+            icon_entity.scale = icon_scale
+        else:
+            hotbar_icons.append(
+                Entity(
+                    parent=hotbar_bg,
+                    model="quad",
+                    texture=get_block_icon_texture(BLOCK_TYPES[hotbar_block_indices[index]]),
+                    position=(slot_x, icon_y, 0.8),
+                    scale=icon_scale,
+                )
             )
-        )
 
 
 def refresh_hotbar_icons():
@@ -2152,7 +2249,8 @@ def refresh_hotbar_icons():
 
 
 def update_hotbar_ui():
-    hotbar_selector.x = hotbar_slot_positions[selected_block_index]
+    sync_hotbar_layout()
+    hotbar_selector.position = Vec3(hotbar_slot_positions[selected_block_index], 0.0, hotbar_selector.z)
     refresh_hotbar_icons()
     refresh_inventory_hotbar_preview()
 
@@ -2259,7 +2357,20 @@ def set_inventory_entities_enabled(enabled):
         icon.enabled = enabled
 
 
+def set_player_enabled(enabled):
+    player.enabled = enabled
+    if enabled and hasattr(player, "cursor") and player.cursor is not None:
+        player.cursor.enabled = False
+
+
+def set_crosshair_visible(visible):
+    if game_crosshair is not None:
+        game_crosshair.enabled = visible
+
+
 def set_game_hud_visible(visible):
+    if visible:
+        sync_hotbar_layout()
     hotbar_bg.enabled = visible
     hotbar_selector.enabled = visible
     for icon in hotbar_icons:
@@ -2268,6 +2379,15 @@ def set_game_hud_visible(visible):
         icon.enabled = visible
     for icon in hud_armor_icons:
         icon.enabled = visible
+    set_crosshair_visible(visible)
+def create_crosshair_ui():
+    global game_crosshair
+    if game_crosshair is not None:
+        return
+
+    game_crosshair = Entity(parent=camera.ui, position=(0, 0, 0.45), enabled=False)
+    Entity(parent=game_crosshair, model="quad", color=color.white, scale=(0.018, 0.002), z=0.001)
+    Entity(parent=game_crosshair, model="quad", color=color.white, scale=(0.002, 0.018), z=0.001)
 
 
 def create_world_loading_ui():
@@ -2522,18 +2642,14 @@ def set_inventory_open(state):
     set_inventory_entities_enabled(inventory_open[0])
 
     if inventory_open[0]:
-        player.enabled = False
+        set_player_enabled(False)
         mouse.locked = False
         set_game_hud_visible(False)
-        if crosshair is not None:
-            crosshair.enabled = False
     else:
         should_enable_player = (not is_game_paused()) and world_bootstrap_ready[0]
-        player.enabled = should_enable_player
+        set_player_enabled(should_enable_player)
         mouse.locked = should_enable_player
         set_game_hud_visible(should_enable_player)
-        if crosshair is not None:
-            crosshair.enabled = should_enable_player
         clear_inventory_drag()
         update_hotbar_ui()
         return
@@ -2547,14 +2663,12 @@ def create_status_hud():
     armor_full = resolve_existing_asset_path([f"{UI_PATH}/Armor_full.png"]) or "white_cube"
     armor_empty = resolve_existing_asset_path([f"{UI_PATH}/Armor_empty.png"]) or "white_cube"
 
-    # Usa ícones individuais com proporção quadrada para evitar aparência achatada.
     icon_scale = (0.026, 0.026)
     spacing = 0.030
     hotbar_left = hotbar_bg.x - (hotbar_bg.scale_x / 2)
     hotbar_top = hotbar_bg.y + (hotbar_bg.scale_y / 2)
     start_x = hotbar_left + (icon_scale[0] * 0.5)
 
-    # Armadura em cima e corações abaixo, ambos acima da hotbar com margem pequena.
     y_hearts = hotbar_top + 0.008 + (icon_scale[1] * 0.5)
     y_armor = y_hearts + (icon_scale[1] * 1.15)
 
@@ -2586,10 +2700,9 @@ def create_status_hud():
 create_hotbar_ui()
 update_hotbar_ui()
 create_status_hud()
+create_crosshair_ui()
 create_world_loading_ui()
 set_game_hud_visible(False)
-if crosshair is not None:
-    crosshair.enabled = False
 highlight_box(None)
 invoke(center_game_window, delay=0.05)
 
@@ -2703,8 +2816,6 @@ def update():
         app.win.setClearColor((16 / 255, 24 / 255, 36 / 255, 1.0))
     except Exception:
         pass
-    # Defensive workaround: some environments expose a giant transparent UI
-    # quad that renders as opaque white. Hide/destroy it when detected.
     cleanup_problematic_ui_quads(destroy_matches=False)
     update_background_music()
 
@@ -2753,11 +2864,9 @@ def update():
                     visible_chunks=ready_chunks,
                 )
                 if not is_game_paused():
-                    player.enabled = True
+                    set_player_enabled(True)
                     mouse.locked = True
                     set_game_hud_visible(True)
-                    if crosshair is not None:
-                        crosshair.enabled = True
         except Exception as exc:
             error_key = repr(exc)
             if world_bootstrap_error[0] != error_key:
@@ -2800,7 +2909,6 @@ def update():
     sun_visual.position = player.position + (sun_direction * 300)
     sun_visual.look_at(camera.world_position)
     
-    # Update procedural cloud field around player
     player_grid_x = math.floor(player.x / CLOUD_GRID_SIZE)
     player_grid_z = math.floor(player.z / CLOUD_GRID_SIZE)
     clouds_to_update = set()
@@ -2881,7 +2989,6 @@ def update():
                 puff.scale = puff_scale
                 puff.color = color.rgba(255, 255, 255, max(0, puff_alpha))
 
-    # Remove clouds that are out of range
     clouds_to_remove = [key for key in active_clouds if key not in clouds_to_update]
     for key in clouds_to_remove:
         return_cloud_to_pool(active_clouds[key])
@@ -2892,6 +2999,17 @@ def update():
 
     current_grounded = player.grounded if hasattr(player, "grounded") else player.y <= 1
     support_block = get_supporting_block() if world_bootstrap_ready[0] else None
+    if world_bootstrap_ready[0] and support_block is None:
+        predicted_grounded_y = get_grounded_y_for_entity_at(
+            player,
+            player.x,
+            player.z,
+            probe_from_y=max(player.y + 12.0, SEA_LEVEL + 24.0),
+        )
+        if predicted_grounded_y is not None and abs(player.y - predicted_grounded_y) < 3.0:
+            player.y = predicted_grounded_y
+            current_grounded = True
+            support_block = get_supporting_block()
     last_support_block[0] = support_block
 
     if world_bootstrap_ready[0] and player.y < spawn_point.y - 64:

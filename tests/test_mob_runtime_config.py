@@ -43,7 +43,7 @@ def test_chicken_runtime_was_extracted_from_main():
 def test_custom_crosshair_is_integrated():
     text = MAIN_PY.read_text(encoding="utf-8")
     assert "crosshair = None" in text
-    assert "crosshair.enabled" in text
+    assert "game_crosshair.enabled" in text
 
 
 def test_background_music_candidates_are_configured():

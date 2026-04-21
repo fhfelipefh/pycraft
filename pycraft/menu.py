@@ -70,8 +70,6 @@ class GameMenu:
                 ["assets/RPG UI pack - Demo (by Franuka)/FantasyRPGtext (size 8).ttf"]
             )
         )
-        # Keep menu visuals fully opaque to avoid compositor/alpha issues
-        # that can make the screen look washed-out or blank on some setups.
         self.menu_panel_texture = None
         self.header_panel_texture = None
         self.settings_panel_texture = None
