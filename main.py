@@ -54,6 +54,7 @@ from pycraft.terrain_async_scheduler import DesiredPositionsScheduler
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from pycraft.menu import GameMenu
+from pycraft.gameplay import resolve_pick_block_slot, approach_value
 
 loadPrcFileData("", "framebuffer-alpha #f")
 loadPrcFileData("", "alpha-bits 0")
@@ -672,6 +673,11 @@ ui_cleanup_cooldown = [0.0]
 highlight_refresh_cooldown = [0.0]
 support_block_refresh_cooldown = [0.0]
 cached_target_block = [None]
+break_cooldown = [0.0]
+place_cooldown = [0.0]
+BASE_FOV = 80
+DEFAULT_BREAK_INTERVAL = 0.25
+DEFAULT_PLACE_INTERVAL = 0.20
 
 active_chunks = {}
 custom_blocks = {}
@@ -2274,6 +2280,24 @@ def set_selected_hotbar_slot(slot_index):
     update_hotbar_ui()
 
 
+
+
+def handle_pick_block(target_block_type):
+    global selected_block_index, hotbar_block_indices
+    if target_block_type is None:
+        return
+    try:
+        block_type_index = BLOCK_TYPES.index(target_block_type)
+    except ValueError:
+        return
+
+    new_slot, new_hotbar = resolve_pick_block_slot(
+        hotbar_block_indices, block_type_index, selected_block_index
+    )
+    hotbar_block_indices = new_hotbar
+    set_selected_hotbar_slot(new_slot)
+
+
 def assign_inventory_block_to_selected_slot(block_index):
     hotbar_block_indices[selected_block_index] = block_index
     update_hotbar_ui()
@@ -2791,6 +2815,12 @@ def input(key):
         set_selected_hotbar_slot((selected_block_index - 1) % HOTBAR_SLOT_COUNT)
         return
 
+    if key == "middle mouse down" or key == "middle mouse":
+        target_block = get_target_block()
+        if target_block is not None and can_interact_with_block(target_block):
+            handle_pick_block(target_block.block_type)
+        return
+
     if key == "space":
         support_block = last_support_block[0]
         if player.enabled and player.grounded and support_block is not None:
@@ -2805,22 +2835,40 @@ def input(key):
         return
 
     if key == "right mouse down":
-        new_position = (
-            target_block.position[0] + target_block.normal[0],
-            target_block.position[1] + target_block.normal[1],
-            target_block.position[2] + target_block.normal[2],
-        )
-        if get_block_type_at(new_position) is None:
-            block_type = get_selected_block_type()
-            set_block_at(new_position, block_type)
-            play_material_sound(block_type, "place")
+        place_block_action(target_block)
+        place_cooldown[0] = DEFAULT_PLACE_INTERVAL
         return
 
     if key == "left mouse down":
-        play_material_sound(target_block.block_type, "hit")
-        play_material_sound(target_block.block_type, "break")
-        remove_block_at(target_block.position)
-        highlight_box(None)
+        break_block_action(target_block)
+        break_cooldown[0] = DEFAULT_BREAK_INTERVAL
+        return
+
+
+def place_block_action(target_block):
+    if target_block is None or not can_interact_with_block(target_block):
+        return False
+    new_position = (
+        target_block.position[0] + target_block.normal[0],
+        target_block.position[1] + target_block.normal[1],
+        target_block.position[2] + target_block.normal[2],
+    )
+    if get_block_type_at(new_position) is None:
+        block_type = get_selected_block_type()
+        set_block_at(new_position, block_type)
+        play_material_sound(block_type, "place")
+        return True
+    return False
+
+
+def break_block_action(target_block):
+    if target_block is None or not can_interact_with_block(target_block):
+        return False
+    play_material_sound(target_block.block_type, "hit")
+    play_material_sound(target_block.block_type, "break")
+    remove_block_at(target_block.position)
+    highlight_box(None)
+    return True
 
 
 def update():
@@ -2913,6 +2961,27 @@ def update():
         or held_keys.get("right control")
     )
     player.speed = player.base_speed * (RUN_SPEED_MULTIPLIER if is_running else WALK_SPEED_MULTIPLIER)
+
+    moving = False
+    if hasattr(player, "input_direction"):
+        moving = player.input_direction.magnitude() > 0.1
+
+    # Dynamic Sprint FOV transition
+    target_fov = BASE_FOV + (10.0 if (is_running and moving) else 0.0)
+    camera.fov = approach_value(camera.fov, target_fov, time.dt * 40.0)
+
+    # Continuous block breaking and placing timers
+    break_cooldown[0] -= time.dt
+    place_cooldown[0] -= time.dt
+
+    if player.enabled and not is_game_paused() and not inventory_open[0]:
+        target_block = cached_target_block[0] or get_target_block()
+        if held_keys.get("left mouse") and break_cooldown[0] <= 0:
+            if break_block_action(target_block):
+                break_cooldown[0] = DEFAULT_BREAK_INTERVAL
+        elif held_keys.get("right mouse") and place_cooldown[0] <= 0:
+            if place_block_action(target_block):
+                place_cooldown[0] = DEFAULT_PLACE_INTERVAL
 
     sun_elapsed_time[0] = (sun_elapsed_time[0] + time.dt) % SUN_CYCLE_SECONDS
     day_progress = sun_elapsed_time[0] / SUN_CYCLE_SECONDS
